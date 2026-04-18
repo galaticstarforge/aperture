@@ -27,6 +27,8 @@ fs2 = "0.4"
 parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+regex = "1"
+once_cell = "1"
 
 [features]
 # Default feature set mirrors tauri defaults; custom protocol is not needed in phase 1.

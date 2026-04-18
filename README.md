@@ -5,29 +5,42 @@ A GUI-native `.mjs` script runner. Define a script, get a GUI for free.
 See [`design.md`](./design.md) for the full v2 design spec and
 [`phases/`](./phases) for the phased implementation plan.
 
-## Status — Phase 1 (Foundation & Process Model)
+## Status — Phase 2 (State, Schema & Reactivity)
 
-This branch implements the foundation from
-[`phases/phase-1-foundation-and-process-model.md`](./phases/phase-1-foundation-and-process-model.md):
+This branch layers the state + schema backbone from
+[`phases/phase-2-state-schema-and-reactivity.md`](./phases/phase-2-state-schema-and-reactivity.md)
+on top of the Phase 1 foundation:
 
-- Tauri 2.x + React + Vite shell (dark theme, Lucide icons)
-- Binary entry point: `aperture <script-source> <working-dir>`
-- Argv parsing with `--offline` and `--key value` / `--key=value` flags
-- Remote URL sources rejected with a clear "deferred to Phase 6" error
-- `~/.aperture/` filesystem layout (`deps/ scripts/ state/ windows/ logs/ locks/`)
-- Multi-instance guard (file lock + Tauri single-instance plugin)
-- Child-process script host (system Node; bundled Bun-Node arrives in Phase 6)
-- NDJSON protocol on stdout; raw stderr stream; full `ScriptEvent` /
-  `GUIEvent` unions defined
-- Virtual `aperture:runtime` module via Node's `module.register` hooks —
-  `progress` and `log` are real; everything else is a stub that throws a
-  clear "not implemented until Phase N" error
-- Lifecycle skeleton: install screen → running view → death screen with
-  **Reload Script** (Cmd/Ctrl+R)
-- `cancel` sent to the child on window close with a 5s grace window
+- `runtime.state` is live — `set` / `get` / `setIn` / `push` / `watch` /
+  `persist` all implemented in the child-process shim
+- `schema` + `state` exports are extracted into a full `ScriptManifest`;
+  zod is duck-typed so scripts can bring their own instance
+- `.persist()` and `.stream()` extend `ZodType.prototype` via a symbol
+  marker that walks inner wrappers — survives `.default()` / `.optional()`
+  chaining in any order
+- Launch-time params merge URL query + CLI flags (CLI wins on collision),
+  auto-parse JSON-shaped strings, then run through `schema.safeParse`; on
+  failure the shim emits a structured `error` event with the zod issue
+  list for the death screen to render
+- Watchers fire on any write, any origin; same-key handlers serialize via
+  a per-key promise chain; cross-key handlers run in parallel; async
+  handlers supported
+- GUI-origin writes flow frontend → Tauri `send_to_child` → child stdin
+  → store; writes are coalesced per key at `requestAnimationFrame` on the
+  frontend so rapid-fire user input lands as ≤ 1 event per ~16ms
+- Stream-flagged keys chunk into `state:set:chunk` frames of at most 64 KB
+  each; the Tauri backend buffers and forwards a single reassembled
+  `state-set` to the frontend on `final: true`
+- Persistence writes `~/.aperture/state/<cache-key>.json` atomically;
+  cache key is `sha256(canonical_path)[..16] + "-" + major.minor`. Scripts
+  without `// @aperture-version` are never cached; a minor/major bump
+  invalidates the snapshot on next launch
+- State updates are mirrored to the frontend's shadow store; a dev handle
+  (`window.__aperture`) exposes `setState` / `get` / `subscribe` so
+  Phase 2 behavior is observable without any element renderer
 
-State/zod, the element renderer, the `invoke` suite, workers, and the CLI
-sub-commands (`new`/`dev`/`validate`/`run`/`docs`) land in phases 2–6.
+The `invoke` suite, element rendering, workers, and the CLI sub-commands
+(`new`/`dev`/`validate`/`run`/`docs`) remain in phases 3–6.
 
 ## Project Layout
 
@@ -55,12 +68,18 @@ aperture/
 ├── runtime-shim/              # virtual `aperture:runtime` module
 │   ├── loader.mjs             # --import hook
 │   ├── hooks.mjs              # module.register resolver
-│   ├── shim.mjs               # exported API stubs
-│   └── bootstrap.mjs          # per-child lifecycle driver
+│   ├── shim.mjs               # runtime API (state, progress, log, …)
+│   ├── bootstrap.mjs          # per-child lifecycle driver
+│   ├── schema-markers.mjs     # zod .persist() / .stream()
+│   ├── state-store.mjs        # reactive state + watchers + chunked emit
+│   ├── manifest.mjs           # ScriptManifest extraction
+│   ├── params.mjs             # URL/CLI merge + safeParse
+│   └── __tests__/             # `node --test` suite
 └── examples/
-    ├── empty.mjs              # AC #1 — window opens, stays alive
-    ├── log.mjs                # AC #3 — log() emits NDJSON
-    └── throw.mjs              # AC #2 — crash → death screen
+    ├── empty.mjs              # Phase 1 AC #1
+    ├── log.mjs                # Phase 1 AC #3
+    ├── throw.mjs              # Phase 1 AC #2
+    └── phase2-state.mjs       # Phase 2 schema + state + watch smoke script
 ```
 
 ## Building & Running (dev)
@@ -95,9 +114,41 @@ Set `APERTURE_NODE=/path/to/node` to override the Node binary selection.
 | 7 | Garbage NDJSON on stdout is reported to the console without crashing the parser |
 | 8 | Closing the window sends `{"type":"cancel"}` on stdin and waits ≤ 5s before SIGKILL |
 
+## Acceptance Criteria — Phase 2
+
+All ten criteria from `phases/phase-2-state-schema-and-reactivity.md` are
+covered by the automated suite (`npm run test:shim`, plus
+`cargo test --lib` for backend units):
+
+| # | Check | Coverage |
+|---|---|---|
+| 1 | CLI `--targetDir ./src` lands as `params.targetDir` in `onLoad` | `e2e-bootstrap` AC #1 |
+| 2 | CLI wins over URL query on collision | `e2e-bootstrap` AC #2 |
+| 3 | `--filters='["*.js"]'` parses to an array | `e2e-bootstrap` AC #3 |
+| 4 | `safeParse` failure routes to a structured `error` event | `e2e-bootstrap` AC #4 |
+| 5 | `state.watch` fires on script + GUI writes; same-key serializes | `state-store` tests |
+| 6 | GUI rapid-fire writes coalesce to ≤1 per ~16ms | frontend rAF coalescer (`state-bridge.ts`) |
+| 7 | `.stream()` key chunks a 10MB value without stalling logs | `e2e-bootstrap` AC #7 |
+| 8 | `persist()` + restart → persistKeys survive | `e2e-bootstrap` AC #8/9 |
+| 9 | `// @aperture-version` minor bump discards snapshot | `cache_key` + `e2e-bootstrap` AC #8/9 |
+| 10 | `from: 'schema'` keys readable via `runtime.state.get` | `e2e-bootstrap` AC #10 |
+
+## Testing
+
+```bash
+# Frontend + shim
+npm install
+npm run test:shim         # 34 tests across 5 files
+npm run build             # tsc + vite build
+
+# Backend
+cd src-tauri && cargo test --lib
+```
+
 ## Design Contract Preserved for Later Phases
 
-Scripts can already `import { … } from 'aperture:runtime'` and see the full
-API surface — calls to stubbed members throw with a clear reference to the
-phase that implements them. This means Phase 2/3/4/5 land without needing to
-touch the script contract.
+Scripts continue to `import { … } from 'aperture:runtime'`. The Phase 2
+surface adds `state.set/get/setIn/push/watch/persist` as real behavior;
+`invoke`, `invokeStream`, `on`, and `createWorker` still throw with a
+clear phase reference. Phases 3–5 layer rendering, native calls, and
+workers without needing to rewrite the script contract.

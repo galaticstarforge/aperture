@@ -6,6 +6,9 @@ dist/
 # Tauri / Rust
 src-tauri/target/
 src-tauri/gen/schemas/
+src-tauri/Cargo.lock
+# Dev-only placeholder icon; real assets land in Phase 6.
+src-tauri/icons/
 
 # Editor / OS
 .DS_Store

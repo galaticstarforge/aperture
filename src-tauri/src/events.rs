@@ -133,6 +133,14 @@ pub enum BackendMessage {
     Script {
         event: Value,
     },
+    /// A fully-reassembled `state:set` derived from one or more
+    /// `state:set:chunk` frames emitted by the script. The frontend treats
+    /// this identically to a non-streamed `state:set` — reassembly is
+    /// transparent per design.md §"Streaming Opt-In".
+    StateSet {
+        key: String,
+        value: Value,
+    },
     Stderr {
         line: String,
     },
