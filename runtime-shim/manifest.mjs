@@ -44,6 +44,9 @@ export function extractManifest(userModule) {
     onLoad: typeof userModule.onLoad === 'function' ? userModule.onLoad : null,
     onExit: typeof userModule.onExit === 'function' ? userModule.onExit : null,
     headless: typeof userModule.headless === 'function' ? userModule.headless : null,
+    timeoutMs: typeof userModule.timeoutMs === 'number' && userModule.timeoutMs > 0
+      ? userModule.timeoutMs
+      : null,
     callbacks,
   }
 }
@@ -62,6 +65,7 @@ const RESERVED_EXPORTS = new Set([
   'ui',
   'formatters',
   'meta',
+  'timeoutMs',
   'default',
 ])
 

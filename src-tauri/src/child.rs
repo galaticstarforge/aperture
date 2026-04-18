@@ -95,9 +95,9 @@ impl ChildHandle {
         Ok(())
     }
 
-    /// Send `{"type":"cancel"}`, wait up to 5s for exit, then SIGKILL.
+    /// Send `{"type":"cancel","reason":"window-close"}`, wait up to 5s for exit, then SIGKILL.
     pub async fn shutdown_with_grace(&self) {
-        let _ = self.send_line(r#"{"type":"cancel"}"#).await;
+        let _ = self.send_line(r#"{"type":"cancel","reason":"window-close"}"#).await;
         // Close stdin so the child sees EOF even if it isn't listening for
         // cancel yet (Phase 4 wires the real handler).
         {

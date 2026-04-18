@@ -1,15 +1,11 @@
-// Phase 2 child-process bootstrap.
+// Phase 4 child-process bootstrap.
 //
-// Responsibilities layered on top of Phase 1:
-//   - Extract the full ScriptManifest (schema, state, ui, meta, …) up front
-//   - Build the launch-time `params`: merge URL query + CLI flags, coerce
-//     complex values, run `schema.safeParse`
-//   - Initialize the reactive StateStore from `state.parse({})` + the
-//     persisted snapshot on disk + schema-backed overlays
-//   - Wire GUI → script state writes (`state:set` / `state:changed` on
-//     stdin) into the same store, so watchers fire symmetrically
-//   - Emit structured errors on schema/params validation failure so the
-//     death screen can render them
+// Responsibilities layered on top of Phase 2/3:
+//   - Route `invoke:result` / `invoke:stream` stdin messages to shim resolvers
+//   - Route `format:request` stdin messages to the shim formatter handler
+//   - Wire `call` handler with `meta.returnsInto` auto-write
+//   - Propagate `cancel` reason through to __abort
+//   - Extract `timeoutMs` from user module; arm a Node timeout if set
 //
 // Invocation shape (from the Tauri backend):
 //
@@ -99,8 +95,6 @@ if (stateFilePath) {
     const raw = await readFile(stateFilePath, 'utf8')
     persistedSnapshot = JSON.parse(raw)
   } catch (err) {
-    // Missing / unreadable → falls back to defaults. A malformed snapshot
-    // is logged so the developer can inspect.
     if (err?.code !== 'ENOENT') {
       runtime.log(
         `persisted state snapshot unreadable: ${err?.message ?? err}`,
@@ -126,7 +120,7 @@ const store = new StateStore({
 
 runtime.__installStore(store)
 
-// --- emit manifest event (Phase 3) ------------------------------------------
+// --- emit manifest event -----------------------------------------------------
 
 const currentStateSnapshot = () => Object.fromEntries(store.values)
 
@@ -146,6 +140,8 @@ emit({
   ui: initialUiTree,
   window: manifest.window,
   callbacks: Object.keys(manifest.callbacks),
+  formatters: Object.keys(manifest.formatters ?? {}),
+  timeoutMs: typeof manifest.timeoutMs === 'number' ? manifest.timeoutMs : null,
 })
 
 // For function-form ui, re-emit the tree on any state change via a debounced
@@ -160,11 +156,10 @@ if (isUiFn) {
       try {
         emit({ type: 'ui:update', tree: manifest.ui(currentStateSnapshot(), paramsResult.data) })
       } catch {
-        // Swallow - a bad ui function shouldn't crash the process.
+        // Swallow — a bad ui function shouldn't crash the process.
       }
     })
   }
-  // Watch every declared state key.
   if (manifest.state) {
     const shape =
       typeof manifest.state._def?.shape === 'function'
@@ -178,14 +173,29 @@ if (isUiFn) {
   }
 }
 
+// --- hard timeout (export const timeoutMs) -----------------------------------
+
+const scriptTimeoutMs =
+  typeof userModule.timeoutMs === 'number' && userModule.timeoutMs > 0
+    ? userModule.timeoutMs
+    : null
+
+if (scriptTimeoutMs) {
+  const t = setTimeout(() => {
+    void callOnExit('timeout')
+  }, scriptTimeoutMs)
+  // Don't let the timer keep the process alive past natural exit.
+  if (typeof t.unref === 'function') t.unref()
+}
+
 // --- stdin wiring for GUI → script writes ------------------------------------
 
 let exiting = false
 
-async function callOnExit() {
+async function callOnExit(reason = 'exit') {
   if (exiting) return
   exiting = true
-  runtime.__abort('exit')
+  runtime.__abort(reason)
   const timer = new Promise((_, reject) =>
     setTimeout(() => reject(new Error('onExit timed out after 5000ms')), 5000),
   )
@@ -218,39 +228,84 @@ rl.on('line', (line) => {
   try {
     msg = JSON.parse(trimmed)
   } catch {
-    // Ignore malformed stdin lines (complement of backend malformed-stdout
-    // resilience).
     return
   }
   if (!msg || typeof msg !== 'object') return
   switch (msg.type) {
     case 'cancel':
-      void callOnExit()
+      void callOnExit(msg.reason ?? 'cancelled')
       return
+
     case 'state:set':
     case 'state:changed':
       if (typeof msg.key === 'string') {
         store.set(msg.key, msg.value, 'gui')
       }
       return
+
+    case 'invoke:result': {
+      const { callId, result, error } = msg
+      if (typeof callId !== 'string') return
+      if (error) {
+        runtime.__rejectInvoke(callId, String(error))
+      } else {
+        runtime.__resolveInvoke(callId, result)
+      }
+      return
+    }
+
+    case 'invoke:stream': {
+      const { callId, chunk, final: isFinal, error } = msg
+      if (typeof callId !== 'string') return
+      if (error) {
+        runtime.__abortStream(callId, String(error))
+      } else {
+        runtime.__pushStreamChunk(callId, chunk, Boolean(isFinal))
+      }
+      return
+    }
+
+    case 'format:request': {
+      const { callId, name, value, context } = msg
+      if (typeof callId !== 'string' || typeof name !== 'string') return
+      runtime.__handleFormatRequest(name, value, context ?? {}, callId, manifest.formatters)
+      return
+    }
+
     case 'call': {
-      // Dispatch a named callback. Phase 4 adds returnsInto / invoke handling.
       const fn = typeof msg.fn === 'string' ? manifest.callbacks[msg.fn] : null
-      if (!fn) return
+      if (!fn) {
+        if (typeof msg.fn === 'string') {
+          runtime.log(`callback not found: ${msg.fn}`, 'warn')
+        }
+        return
+      }
+      const fnName = msg.fn
       void Promise.resolve()
         .then(() => fn(msg.args ?? {}, runtime))
+        .then(async (result) => {
+          const fnMeta = manifest.meta?.[fnName]
+          if (fnMeta?.returnsInto) {
+            store.set(fnMeta.returnsInto, result, 'script')
+          }
+        })
         .catch((err) => {
+          // AbortError from a cancelled invoke inside a callback is not fatal.
+          if (runtime.signal.aborted && err?.name === 'AbortError') {
+            runtime.log(`callback ${fnName} aborted`, 'warn')
+            return
+          }
           emitError(err?.message ?? String(err), err?.stack)
         })
       return
     }
+
     default:
-      // Other GUIEvent variants (invoke:result, …) are picked up in Phases 4+.
       return
   }
 })
 rl.on('close', () => {
-  void callOnExit()
+  void callOnExit('window-close')
 })
 
 // --- onLoad ------------------------------------------------------------------
@@ -267,10 +322,8 @@ if (manifest.onLoad) {
   emit({ type: 'result', data: null })
 }
 
-// Mirror initial state to the GUI once, so the frontend's shadow map starts
-// in sync even for keys the script hasn't actively `set()`.
+// Mirror initial state to the GUI once.
 for (const [k, v] of Object.entries(initialState)) {
-  // Streaming keys go through the chunked path for consistency.
   if (store.streamKeys.has(k)) {
     store.set(k, v, 'script')
   } else {

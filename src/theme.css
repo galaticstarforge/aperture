@@ -646,3 +646,138 @@ button.secondary {
 .ap-log-entry__data {
   font-size: 10.5px;
 }
+
+/* --- Phase 4: global progress bar ---------------------------------------- */
+
+.ap-progress-bar-wrap {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  z-index: 9999;
+  background: var(--ap-border);
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+}
+
+.ap-progress-bar-fill {
+  height: 100%;
+  background: var(--ap-info);
+  transition: width 0.15s ease;
+}
+
+.ap-progress-bar-label {
+  position: absolute;
+  top: 6px;
+  right: 12px;
+  font-size: 10px;
+  color: var(--ap-text-dim);
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+/* --- Phase 4: invoke modal overlay --------------------------------------- */
+
+.ap-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ap-modal {
+  background: var(--ap-bg-elev);
+  border: 1px solid var(--ap-border);
+  border-radius: 8px;
+  padding: 24px;
+  min-width: 320px;
+  max-width: 480px;
+  width: 90%;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.ap-modal__message {
+  margin: 0;
+  color: var(--ap-text);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.ap-modal__input {
+  width: 100%;
+  background: var(--ap-bg);
+  border: 1px solid var(--ap-border);
+  border-radius: 6px;
+  color: var(--ap-text);
+  font-family: inherit;
+  font-size: 14px;
+  padding: 8px 10px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.ap-modal__input:focus {
+  border-color: var(--ap-info);
+}
+
+.ap-modal__actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+/* --- Phase 4: log entry data blob ----------------------------------------- */
+
+.ap-log-entry__data-wrap {
+  display: inline-flex;
+  flex-direction: column;
+  vertical-align: top;
+  margin-left: 6px;
+}
+
+.ap-log-entry__data-toggle {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--ap-text-dim);
+  font-size: 10.5px;
+  font-family: inherit;
+}
+
+.ap-log-entry__data-toggle:hover {
+  color: var(--ap-text);
+}
+
+.ap-log-entry__data-preview {
+  opacity: 0.7;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ap-log-entry__data-json {
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  background: var(--ap-bg);
+  border: 1px solid var(--ap-border);
+  border-radius: 4px;
+  font-family: var(--ap-mono);
+  font-size: 11px;
+  color: var(--ap-text-dim);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-width: 480px;
+  overflow-x: auto;
+}

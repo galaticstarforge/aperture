@@ -26,6 +26,8 @@ import {
   __installStore,
   __setParams,
   __abort,
+  __resolveInvoke,
+  __rejectInvoke,
 } from '../shim.mjs'
 
 // ---------------------------------------------------------------------------
@@ -258,36 +260,131 @@ test('__setParams freezes the params object', () => {
 })
 
 // ---------------------------------------------------------------------------
+// invoke — Phase 4 real implementation
+// (Must run BEFORE __abort so signal is not yet aborted.)
+// ---------------------------------------------------------------------------
+
+test('invoke returns a Promise and emits invoke event', async () => {
+  const lines = []
+  const origWrite = process.stdout.write.bind(process.stdout)
+  process.stdout.write = (chunk) => {
+    if (typeof chunk === 'string') {
+      for (const part of chunk.split('\n')) if (part.trim()) lines.push(part)
+    }
+    return true
+  }
+  const p = invoke('someOp', { mode: 'file' })
+  process.stdout.write = origWrite
+
+  assert.ok(p instanceof Promise, 'invoke returns Promise')
+
+  const emitted = lines.map((l) => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean)
+  const evt = emitted.find((e) => e.type === 'invoke' && e.fn === 'someOp')
+  assert.ok(evt, 'invoke event emitted to stdout')
+  assert.ok(typeof evt.callId === 'string', 'callId is string')
+  assert.deepEqual(evt.args, { mode: 'file' })
+
+  // Resolve to prevent unhandled rejection.
+  __resolveInvoke(evt.callId, { paths: ['/tmp'] })
+  await p
+})
+
+test('invoke resolves when __resolveInvoke called with matching callId', async () => {
+  const lines = []
+  const origWrite = process.stdout.write.bind(process.stdout)
+  process.stdout.write = (chunk) => {
+    if (typeof chunk === 'string') {
+      for (const part of chunk.split('\n')) if (part.trim()) lines.push(part)
+    }
+    return true
+  }
+  const p = invoke('testOp', { x: 1 })
+  process.stdout.write = origWrite
+
+  const emitted = lines.map((l) => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean)
+  const invokeEvt = emitted.find((e) => e.type === 'invoke' && e.fn === 'testOp')
+  assert.ok(invokeEvt, 'invoke event emitted to stdout')
+
+  __resolveInvoke(invokeEvt.callId, { confirmed: true })
+  const result = await p
+  assert.deepEqual(result, { confirmed: true })
+})
+
+test('invoke rejects when __rejectInvoke called', async () => {
+  const lines = []
+  const origWrite = process.stdout.write.bind(process.stdout)
+  process.stdout.write = (chunk) => {
+    if (typeof chunk === 'string') {
+      for (const part of chunk.split('\n')) if (part.trim()) lines.push(part)
+    }
+    return true
+  }
+  const p = invoke('failOp', {})
+  process.stdout.write = origWrite
+
+  const emitted = lines.map((l) => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean)
+  const invokeEvt = emitted.find((e) => e.type === 'invoke' && e.fn === 'failOp')
+  assert.ok(invokeEvt, 'failOp invoke event emitted')
+
+  __rejectInvoke(invokeEvt.callId, 'something went wrong')
+  await assert.rejects(p, /something went wrong/)
+})
+
+test('invokeStream emits invoke event with stream:true and yields chunks', async () => {
+  const lines = []
+  const origWrite = process.stdout.write.bind(process.stdout)
+  process.stdout.write = (chunk) => {
+    if (typeof chunk === 'string') {
+      for (const part of chunk.split('\n')) if (part.trim()) lines.push(part)
+    }
+    return true
+  }
+
+  const gen = invokeStream('streamOp', { recursive: true })
+  const next = gen.next()
+
+  process.stdout.write = origWrite
+
+  const emitted = lines.map((l) => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean)
+  const invokeEvt = emitted.find((e) => e.type === 'invoke' && e.fn === 'streamOp')
+  assert.ok(invokeEvt, 'invoke stream event emitted')
+  assert.equal(invokeEvt.stream, true, 'stream flag set')
+
+  const { __pushStreamChunk } = await import('../shim.mjs')
+  __pushStreamChunk(invokeEvt.callId, { count: 5 }, true)
+
+  const { value } = await next
+  assert.deepEqual(value, { count: 5 })
+})
+
+// ---------------------------------------------------------------------------
 // signal / __abort
+// (Must run AFTER invoke tests since __abort is permanent for this singleton.)
 // ---------------------------------------------------------------------------
 
 test('signal is an AbortSignal that fires on __abort', () => {
   assert.ok(signal instanceof AbortSignal)
-  assert.equal(signal.aborted, false) // may be true if earlier test called __abort
-  // Note: once aborted the signal stays aborted; we just verify the API shape.
   assert.equal(typeof signal.addEventListener, 'function')
 })
 
 test('__abort sets signal.aborted to true', () => {
-  // If already aborted from a previous call, this is a no-op, still aborted.
   __abort('test reason')
   assert.equal(signal.aborted, true)
 })
 
-// ---------------------------------------------------------------------------
-// Phase-stub functions — each must throw with a clear "Phase N" message
-// ---------------------------------------------------------------------------
-
-test('invoke throws Phase 4 not-yet error', () => {
-  assert.throws(() => invoke(), /Phase 4/)
+test('invoke rejects immediately when signal is already aborted', async () => {
+  // signal is aborted from the test above.
+  const p = invoke('afterAbort', {})
+  p.catch(() => {})
+  await assert.rejects(p, { name: 'AbortError' })
 })
 
-test('invokeStream throws Phase 4 not-yet error', () => {
-  assert.throws(() => invokeStream(), /Phase 4/)
-})
+// ---------------------------------------------------------------------------
+// Phase-stub functions
+// ---------------------------------------------------------------------------
 
-test('on throws Phase 4 not-yet error', () => {
-  assert.throws(() => on(), /Phase 4/)
+test('on throws not-yet error', () => {
+  assert.throws(() => on(), /Phase 5/)
 })
 
 test('createWorker throws Phase 5 not-yet error', () => {
