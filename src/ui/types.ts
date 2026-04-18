@@ -204,10 +204,113 @@ export interface ScrollNode extends BaseNode {
   children?: UiNode[]
 }
 
+// --- Data ---
+
+export interface TableColumn {
+  key: string
+  label?: string
+  sortable?: boolean
+  filter?: boolean
+  format?: string
+  width?: number | string
+  cell?: UiNode
+}
+
+export interface TableAction {
+  label: string
+  onClick: string
+  variant?: ButtonVariant
+  selectedAs?: string
+}
+
+export interface TableNode extends BaseNode {
+  type: 'table'
+  bind?: string
+  columns?: TableColumn[]
+  rowKey?: string
+  selectable?: boolean
+  selectedBind?: string
+  selectedAs?: string
+  rowDataAs?: string
+  bulkActions?: TableAction[]
+  maxEntries?: number
+}
+
+export interface TreeAction {
+  label: string
+  icon?: string
+  onClick: string
+  nodeDataAs?: string
+}
+
+export interface TreeNode extends BaseNode {
+  type: 'tree'
+  bind?: string
+  nodeKey?: string
+  labelKey?: string
+  iconKey?: string
+  childrenKey?: string
+  selectable?: boolean
+  selectedBind?: string
+  defaultExpanded?: 'all' | 'none' | string[]
+  onSelect?: string
+  onExpand?: string
+  actions?: TreeAction[]
+  nodeDataAs?: string
+}
+
+export interface ChartSeries {
+  key: string
+  label?: string
+  color?: string
+}
+
+export interface ChartNode extends BaseNode {
+  type: 'chart'
+  bind?: string
+  chartType?: 'line' | 'area' | 'bar' | 'scatter' | 'pie'
+  donut?: boolean
+  xKey?: string
+  nameKey?: string
+  valueKey?: string
+  series?: ChartSeries[]
+  height?: number
+  smooth?: boolean
+  stacked?: boolean
+  grid?: boolean
+  tooltip?: boolean
+  legend?: boolean
+  maxEntries?: number
+}
+
+export interface TimelineNode extends BaseNode {
+  type: 'timeline'
+  bind?: string
+  eventKey?: string
+  autoScroll?: boolean
+  filterLevels?: boolean
+  timestampFormat?: 'relative' | 'absolute' | 'elapsed'
+  onClick?: string
+  eventDataAs?: string
+  logTarget?: string
+  maxEntries?: number
+}
+
+export interface TimelineEvent {
+  id: string | number
+  timestamp: number
+  level?: 'info' | 'warn' | 'error' | 'debug'
+  message: string
+  detail?: string
+  data?: unknown
+  source?: string
+}
+
 export type UiNode =
   | InputNode | NumberNode | TextareaNode | SelectNode | CheckboxNode
   | SliderNode | ButtonNode | FileNode
   | LabelNode | BadgeNode | ProgressNode | CodeNode | OutputNode
   | StatNode | AlertNode | ImageNode
   | RowNode | ColumnNode | CardNode | TabsNode | DividerNode | ScrollNode
+  | TableNode | TreeNode | ChartNode | TimelineNode
   | (BaseNode & { [key: string]: unknown })

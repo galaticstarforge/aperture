@@ -25,6 +25,10 @@ import { CardElement } from './elements/card'
 import { TabsElement } from './elements/tabs'
 import { DividerElement } from './elements/divider'
 import { ScrollElement } from './elements/scroll'
+import { TableElement } from './elements/table'
+import { TreeElement } from './elements/tree'
+import { ChartElement } from './elements/chart'
+import { TimelineElement } from './elements/timeline'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const REGISTRY: Record<string, React.ComponentType<{ node: any }>> = {
@@ -50,6 +54,10 @@ const REGISTRY: Record<string, React.ComponentType<{ node: any }>> = {
   tabs: TabsElement,
   divider: DividerElement,
   scroll: ScrollElement,
+  table: TableElement,
+  tree: TreeElement,
+  chart: ChartElement,
+  timeline: TimelineElement,
 }
 
 export function Element({ node }: { node: UiNode }) {
@@ -61,11 +69,7 @@ export function Element({ node }: { node: UiNode }) {
   const type = (node as { type?: string }).type ?? ''
   const Comp = REGISTRY[type]
 
-  if (!Comp) {
-    // Data elements (table, tree, chart, timeline) land in Phase 5.
-    // Unknown types are silently skipped.
-    return null
-  }
+  if (!Comp) return null
 
   return <Comp node={node} />
 }

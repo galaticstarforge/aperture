@@ -29,6 +29,23 @@ import { extractManifest, buildInitialState, ManifestError } from './manifest.mj
 import { mergeRawParams, validateParams, queryFromSource } from './params.mjs'
 import { StateStore } from './state-store.mjs'
 
+// Recursively scan a UI tree node for timeline elements with logTarget.
+function collectLogTargets(node, found = new Set()) {
+  if (!node || typeof node !== 'object') return found
+  if (node.type === 'timeline' && typeof node.logTarget === 'string') {
+    found.add(node.logTarget)
+  }
+  // Traverse common child array keys.
+  for (const key of ['children', 'footer', 'items']) {
+    const val = node[key]
+    if (Array.isArray(val)) {
+      for (const child of val) collectLogTargets(child, found)
+    }
+  }
+  // Traverse tab items (each has a children array).
+  return found
+}
+
 const scriptArg = process.argv[2] ?? process.env.APERTURE_SCRIPT
 if (!scriptArg) {
   emitError('bootstrap: APERTURE_SCRIPT not set')
@@ -143,6 +160,12 @@ emit({
   formatters: Object.keys(manifest.formatters ?? {}),
   timeoutMs: typeof manifest.timeoutMs === 'number' ? manifest.timeoutMs : null,
 })
+
+// Register logTarget keys from the initial UI tree so runtime.log() routes
+// log events to those state keys (for timeline elements with logTarget).
+for (const key of collectLogTargets(initialUiTree ?? {})) {
+  runtime.__addLogTarget(key)
+}
 
 // For function-form ui, re-emit the tree on any state change via a debounced
 // microtask so rapid multi-key writes collapse into one emission.
