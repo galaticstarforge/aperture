@@ -1,0 +1,309 @@
+//! Child-process host for Aperture scripts.
+//!
+//! Phase 1 uses the system `node` binary on PATH — Phase 6 swaps in the bundled
+//! Bun-provided Node. We pass a tiny loader (`--import ./runtime-shim/loader.mjs`)
+//! which installs a virtual-module resolver for `aperture:runtime` and, via a
+//! `--eval` bootstrap, loads the user script and orchestrates `onLoad` /
+//! `onExit` against NDJSON stdio.
+//!
+//! Env vars are NOT inherited by default. Phase 1 passes through a minimal
+//! safelist; the full `export const env = [...]` approval flow lands in Phase 6.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, ChildStdin, Command};
+use tokio::sync::mpsc;
+use tokio::time::{timeout, Duration};
+
+use crate::ndjson::{LineFramer, ParseOutcome};
+
+/// Rolling buffer of the last N stderr bytes — surfaced in the death screen
+/// when the child exits non-zero without having emitted a structured `error`
+/// event.
+const STDERR_TAIL_CAP: usize = 8 * 1024;
+
+/// Messages the host emits to the rest of the app.
+#[derive(Debug)]
+pub enum HostEvent {
+    /// A well-formed NDJSON value from stdout — caller dispatches as
+    /// `ScriptEvent` if the shape validates.
+    Stdout(serde_json::Value),
+    /// A malformed line — recorded but not fatal.
+    ParseError { line: String, error: String },
+    /// A single stderr line.
+    Stderr(String),
+    /// The child exited.
+    Exit {
+        code: Option<i32>,
+        signal: Option<String>,
+        stderr_tail: String,
+    },
+}
+
+pub struct ChildHandle {
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    child: Arc<Mutex<Option<Child>>>,
+}
+
+impl ChildHandle {
+    /// Write a line of JSON to the child's stdin. Silently drops if stdin is
+    /// already closed (script exited).
+    pub async fn send_line(&self, line: &str) -> std::io::Result<()> {
+        let mut guard = self.stdin.lock();
+        if let Some(stdin) = guard.as_mut() {
+            stdin.write_all(line.as_bytes()).await?;
+            if !line.ends_with('\n') {
+                stdin.write_all(b"\n").await?;
+            }
+            stdin.flush().await?;
+        }
+        Ok(())
+    }
+
+    /// Send `{"type":"cancel"}`, wait up to 5s for exit, then SIGKILL.
+    pub async fn shutdown_with_grace(&self) {
+        let _ = self.send_line(r#"{"type":"cancel"}"#).await;
+        // Close stdin so the child sees EOF even if it isn't listening for
+        // cancel yet (Phase 4 wires the real handler).
+        {
+            let mut guard = self.stdin.lock();
+            *guard = None;
+        }
+        let waiter = {
+            let child = self.child.clone();
+            async move {
+                loop {
+                    let status = {
+                        let mut guard = child.lock();
+                        match guard.as_mut() {
+                            Some(c) => c.try_wait().ok().flatten(),
+                            None => return,
+                        }
+                    };
+                    if status.is_some() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
+        if timeout(Duration::from_secs(5), waiter).await.is_err() {
+            let mut guard = self.child.lock();
+            if let Some(c) = guard.as_mut() {
+                let _ = c.start_kill();
+            }
+        }
+    }
+}
+
+pub struct Spawned {
+    pub handle: ChildHandle,
+    pub events: mpsc::UnboundedReceiver<HostEvent>,
+}
+
+pub struct SpawnConfig {
+    pub node_bin: PathBuf,
+    pub loader_module: PathBuf,
+    pub bootstrap_module: PathBuf,
+    pub script_path: PathBuf,
+    pub cwd: PathBuf,
+    pub params_json: String,
+}
+
+/// Spawn the Aperture script as a child process. Env vars are NOT inherited by
+/// default — a minimal safelist is forwarded.
+pub fn spawn(cfg: SpawnConfig) -> std::io::Result<Spawned> {
+    let env = env_safelist();
+    let mut cmd = Command::new(&cfg.node_bin);
+    cmd.arg("--import")
+        .arg(path_to_file_url(&cfg.loader_module))
+        .arg(&cfg.bootstrap_module)
+        .arg(&cfg.script_path)
+        .env_clear();
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.env("APERTURE_SCRIPT", &cfg.script_path);
+    cmd.env("APERTURE_PARAMS", &cfg.params_json);
+    cmd.current_dir(&cfg.cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = cmd.spawn()?;
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let stdin = child.stdin.take().expect("stdin piped");
+
+    let (tx, rx) = mpsc::unbounded_channel();
+    let child = Arc::new(Mutex::new(Some(child)));
+    let stdin = Arc::new(Mutex::new(Some(stdin)));
+
+    // stdout → NDJSON framer → HostEvent::Stdout / ParseError
+    {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut reader = stdout;
+            let mut buf = [0u8; 8192];
+            let mut framer = LineFramer::new();
+            loop {
+                let n = match reader.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                for outcome in framer.push(&buf[..n]) {
+                    dispatch_outcome(&tx, outcome);
+                }
+            }
+            for outcome in framer.flush() {
+                dispatch_outcome(&tx, outcome);
+            }
+        });
+    }
+
+    // stderr → rolling tail + per-line events
+    let stderr_tail = Arc::new(Mutex::new(Vec::<u8>::with_capacity(STDERR_TAIL_CAP)));
+    {
+        let tx = tx.clone();
+        let tail = stderr_tail.clone();
+        tokio::spawn(async move {
+            let mut reader = stderr;
+            let mut buf = [0u8; 4096];
+            let mut line_buf = Vec::<u8>::new();
+            loop {
+                let n = match reader.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                {
+                    let mut t = tail.lock();
+                    t.extend_from_slice(&buf[..n]);
+                    if t.len() > STDERR_TAIL_CAP {
+                        let drop = t.len() - STDERR_TAIL_CAP;
+                        t.drain(..drop);
+                    }
+                }
+                for byte in &buf[..n] {
+                    if *byte == b'\n' {
+                        let line = String::from_utf8_lossy(&line_buf).trim_end().to_string();
+                        line_buf.clear();
+                        if !line.is_empty() {
+                            let _ = tx.send(HostEvent::Stderr(line));
+                        }
+                    } else {
+                        line_buf.push(*byte);
+                    }
+                }
+            }
+            if !line_buf.is_empty() {
+                let line = String::from_utf8_lossy(&line_buf).trim_end().to_string();
+                if !line.is_empty() {
+                    let _ = tx.send(HostEvent::Stderr(line));
+                }
+            }
+        });
+    }
+
+    // Exit watcher.
+    {
+        let child = child.clone();
+        let tx = tx.clone();
+        let tail = stderr_tail.clone();
+        tokio::spawn(async move {
+            let status = {
+                let mut taken = {
+                    let mut guard = child.lock();
+                    guard.take()
+                };
+                match taken.as_mut() {
+                    Some(c) => c.wait().await.ok(),
+                    None => None,
+                }
+            };
+            let (code, signal) = match status {
+                Some(s) => (s.code(), signal_of(&s)),
+                None => (None, None),
+            };
+            let tail_str = {
+                let t = tail.lock();
+                String::from_utf8_lossy(&t).into_owned()
+            };
+            let _ = tx.send(HostEvent::Exit {
+                code,
+                signal,
+                stderr_tail: tail_str,
+            });
+        });
+    }
+
+    Ok(Spawned {
+        handle: ChildHandle { stdin, child },
+        events: rx,
+    })
+}
+
+fn dispatch_outcome(tx: &mpsc::UnboundedSender<HostEvent>, o: ParseOutcome) {
+    match o {
+        ParseOutcome::Value(v) => {
+            let _ = tx.send(HostEvent::Stdout(v));
+        }
+        ParseOutcome::Malformed { line, error } => {
+            let _ = tx.send(HostEvent::ParseError { line, error });
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_of(status: &std::process::ExitStatus) -> Option<String> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal().map(|s| format!("SIG{}", s))
+}
+
+#[cfg(not(unix))]
+fn signal_of(_status: &std::process::ExitStatus) -> Option<String> {
+    None
+}
+
+fn env_safelist() -> HashMap<String, String> {
+    // TODO(phase-6): replace with the full `export const env = [...]` approval
+    // flow. Phase 1 forwards only the basics needed for Node to start and
+    // locate tmp/home on each OS.
+    let mut out = HashMap::new();
+    let keys: &[&str] = &[
+        "HOME",
+        "PATH",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "SystemRoot",
+        "SYSTEMROOT",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+    ];
+    for k in keys {
+        if let Ok(v) = std::env::var(k) {
+            out.insert((*k).to_string(), v);
+        }
+    }
+    out
+}
+
+fn path_to_file_url(p: &Path) -> String {
+    // Node's --import requires a file:// URL on all platforms.
+    match url::Url::from_file_path(p) {
+        Ok(u) => u.to_string(),
+        Err(_) => p.display().to_string(),
+    }
+}
