@@ -354,6 +354,9 @@ test('AC#10 — state backed by schema key is readable via runtime.state.get', a
     const { events, exitCode } = await runShim({
       script,
       cliFlags: { targetDir: './from-cli' },
+      // Bootstrap startup inside the test runner is slower; give onLoad
+      // (which has a 20ms internal wait) enough headroom to complete.
+      waitMs: 600,
     })
     assert.equal(exitCode, 0)
     const live = events.find((e) => e.type === 'log' && e.message.startsWith('live:'))
