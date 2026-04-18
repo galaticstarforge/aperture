@@ -126,6 +126,11 @@ pub enum BackendMessage {
         #[serde(rename = "rawFlags")]
         raw_flags: std::collections::BTreeMap<String, String>,
         offline: bool,
+        #[serde(rename = "devMode")]
+        dev_mode: bool,
+        /// Persisted window geometry (Phase 6). `null` on first launch.
+        #[serde(rename = "persistedGeometry", skip_serializing_if = "Option::is_none")]
+        persisted_geometry: Option<Value>,
     },
     Phase {
         phase: Phase,
@@ -153,11 +158,29 @@ pub enum BackendMessage {
         signal: Option<String>,
         #[serde(rename = "stderrTail")]
         stderr_tail: String,
+        /// Whether a log file exists for the "Show log" death-screen link.
+        #[serde(rename = "logAvailable")]
+        log_available: bool,
     },
     Fatal {
         message: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         stack: Option<String>,
+    },
+    /// Pre-launch env-var approval request.
+    EnvApproval {
+        vars: Vec<String>,
+        #[serde(rename = "cacheKey")]
+        cache_key: String,
+    },
+    /// Progress update for the install screen (dep install, download).
+    InstallProgress {
+        label: String,
+    },
+    /// Dev-mode protocol event (inbound from child or outbound to child).
+    ProtocolEvent {
+        direction: String,
+        event: Value,
     },
 }
 

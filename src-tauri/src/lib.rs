@@ -1,26 +1,31 @@
-//! Aperture Phase 1 Tauri entry point.
+//! Aperture Phase 6 Tauri entry point.
 //!
-//! Responsibilities wired in this phase:
-//! - Argv parsing (script source + cwd + flags + `--offline`)
-//! - Multi-instance guard (file lock + Tauri single-instance plugin)
-//! - Filesystem layout creation under `~/.aperture/`
-//! - Script child-process host with NDJSON framing on stdout
-//! - Lifecycle skeleton: installing → running → death screen
-//! - Full-window death screen with Cmd/Ctrl+R "Reload Script"
+//! Dispatches CLI subcommands (new/validate/run/docs) without starting Tauri,
+//! then launches the GUI for `dev` and default GUI-launch mode.
 //!
-//! Out of scope (later phases): state/zod (Phase 2), element renderer
-//! (Phase 3), `invoke` suite (Phase 4), workers (Phase 5), CLI subcommands
-//! and dep installer (Phase 6).
+//! Phase 6 additions over Phase 5:
+//!   - CLI subcommand dispatch (new/validate/run/docs/dev)
+//!   - Remote URL downloading and semver-aware caching
+//!   - bun-backed dep install into `~/.aperture/deps/`
+//!   - Env-var approval flow (pre-launch dialog)
+//!   - Window geometry persistence
+//!   - Stderr ring-buffer logging to `~/.aperture/logs/<cache-key>.log`
+//!   - Multi-instance polish (focus existing window, exit 0)
+//!   - Dev-mode protocol inspector
 
 pub mod cache_key;
 pub mod child;
 pub mod chunks;
 pub mod cli;
+pub mod config;
+pub mod deps;
 pub mod events;
 pub mod fs_layout;
 pub mod invoke_cmds;
 pub mod lock;
 pub mod ndjson;
+pub mod remote;
+pub mod subcommands;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,90 +38,46 @@ use tokio::sync::mpsc;
 
 use crate::child::{ChildHandle, HostEvent, SpawnConfig, Spawned};
 use crate::chunks::{ChunkBuffers, ChunkOutcome};
-use crate::cli::ParsedArgs;
+use crate::cli::{ApertureCommand, ParsedArgs};
 use crate::events::{BackendMessage, Phase};
 use crate::fs_layout::Layout;
+use crate::subcommands::BundledPaths;
 
 const EVENT_CHANNEL: &str = "aperture://message";
 
-/// State shared across Tauri commands.
+// ─────────────────────────────── AppState ─────────────────────────────────────
+
 pub struct AppState {
     pub args: ParsedArgs,
     pub layout: Layout,
     pub bundled: BundledAssets,
     pub child: Mutex<Option<ChildHandle>>,
-    /// Monotonic session counter. A drive loop emits nothing once its captured
-    /// value lags the current value — this prevents a torn-down child's final
-    /// `ChildExit` from reaching the frontend after a reload.
     pub session: AtomicU64,
+    pub dev_mode: bool,
+    pub cache_key: Mutex<String>,
+    /// One-shot channel for the env-approval frontend response.
+    pub env_approval_tx: Mutex<Option<tokio::sync::oneshot::Sender<bool>>>,
 }
 
 #[derive(Clone)]
 pub struct BundledAssets {
     pub loader_module: PathBuf,
     pub bootstrap_module: PathBuf,
-    /// `node_modules` directories appended to `NODE_PATH` so the child can
-    /// resolve `zod` (and, pre-Phase 6, any other shared packages) without
-    /// installing them in the user's working dir.
     pub node_paths: Vec<PathBuf>,
 }
 
 impl BundledAssets {
-    /// Locate the runtime shim. During dev we look beside the source tree;
-    /// Phase 6 will bundle these into the Tauri resources dir.
     pub fn resolve() -> std::io::Result<Self> {
-        let here = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|x| x.to_path_buf()));
-        let candidates: Vec<PathBuf> = [
-            here.as_ref().map(|p| p.join("runtime-shim")),
-            Some(PathBuf::from("../runtime-shim")),
-            Some(PathBuf::from("runtime-shim")),
-            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../runtime-shim")),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        for c in &candidates {
-            let loader = c.join("loader.mjs");
-            let bootstrap = c.join("bootstrap.mjs");
-            if loader.is_file() && bootstrap.is_file() {
-                // Canonicalize so `url::Url::from_file_path` accepts them on
-                // every platform (it rejects relative paths).
-                let loader = std::fs::canonicalize(&loader).unwrap_or(loader);
-                let bootstrap = std::fs::canonicalize(&bootstrap).unwrap_or(bootstrap);
-                // node_modules typically sits alongside runtime-shim/ at
-                // the repo root. Include both that and the Cargo manifest's
-                // parent node_modules as fall-backs.
-                let mut node_paths = Vec::new();
-                if let Some(parent) = bootstrap.parent().and_then(|p| p.parent()) {
-                    let nm = parent.join("node_modules");
-                    if nm.is_dir() {
-                        node_paths.push(nm);
-                    }
-                }
-                let manifest_nm =
-                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../node_modules");
-                if manifest_nm.is_dir() {
-                    if let Ok(c) = std::fs::canonicalize(&manifest_nm) {
-                        if !node_paths.iter().any(|p| p == &c) {
-                            node_paths.push(c);
-                        }
-                    }
-                }
-                return Ok(Self {
-                    loader_module: loader,
-                    bootstrap_module: bootstrap,
-                    node_paths,
-                });
-            }
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "runtime-shim/loader.mjs not found",
-        ))
+        let bp = BundledPaths::resolve()?;
+        Ok(Self {
+            loader_module: bp.loader_module,
+            bootstrap_module: bp.bootstrap_module,
+            node_paths: bp.node_paths,
+        })
     }
 }
+
+// ─────────────────────────────── run() ────────────────────────────────────────
 
 pub fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -128,21 +89,62 @@ pub fn run() -> anyhow::Result<()> {
         .init();
 
     let raw_args: Vec<String> = std::env::args().collect();
-    let parsed = match cli::parse(raw_args.clone()) {
-        Ok(p) => p,
+    let command = match cli::parse_command(raw_args) {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("aperture: {}", e);
             std::process::exit(2);
         }
     };
 
-    if parsed.source.is_remote() {
-        eprintln!(
-            "aperture: remote script sources are deferred to Phase 6 (got: {})",
-            parsed.source.as_display()
-        );
-        std::process::exit(2);
+    // ── Non-GUI subcommands: handle without Tauri ──────────────────────────────
+    match &command {
+        ApertureCommand::New { name } => {
+            if let Err(e) = subcommands::cmd_new(name.clone()) {
+                eprintln!("aperture: {e}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        ApertureCommand::Docs { section } => {
+            if let Err(e) = subcommands::cmd_docs(section.clone()) {
+                eprintln!("aperture: {e}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        ApertureCommand::Validate { script, headless_lint } => {
+            let bundled = match BundledPaths::resolve() {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("aperture: runtime shim not found: {e}");
+                    std::process::exit(2);
+                }
+            };
+            let _ = subcommands::cmd_validate(script.clone(), *headless_lint, &bundled);
+        }
+        ApertureCommand::HeadlessRun(args) => {
+            let bundled = match BundledPaths::resolve() {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("aperture: runtime shim not found: {e}");
+                    std::process::exit(2);
+                }
+            };
+            if let Err(e) = subcommands::cmd_run(args.clone(), &bundled) {
+                eprintln!("aperture: {e}");
+                std::process::exit(1);
+            }
+        }
+        ApertureCommand::GuiLaunch(_) | ApertureCommand::DevLaunch(_) => {}
     }
+
+    // ── GUI launch (GuiLaunch + DevLaunch) ─────────────────────────────────────
+    let (parsed, dev_mode) = match command {
+        ApertureCommand::GuiLaunch(p) => (p, false),
+        ApertureCommand::DevLaunch(p) => (p, true),
+        _ => unreachable!(),
+    };
 
     let layout = Layout::resolve()?;
     layout.ensure()?;
@@ -151,29 +153,23 @@ pub fn run() -> anyhow::Result<()> {
     match lock::try_acquire(&layout.locks, &canonical)? {
         lock::LockOutcome::Acquired(held) => {
             tracing::info!(lock = %held.path.display(), "acquired instance lock");
-            // Keep the lock alive for the process lifetime by leaking it into
-            // a static — drop would release the flock and let a racing second
-            // launch win.
             let held = Box::leak(Box::new(held));
             let _ = &held.path;
         }
         lock::LockOutcome::AlreadyHeld { path } => {
+            // Phase 6: focus the existing window and exit 0.
             eprintln!(
-                "aperture: another instance is already running for this script ({})\n         the existing window will be focused",
+                "aperture: script already running — focusing existing window ({})",
                 path.display()
             );
-            // The Tauri single-instance plugin in the already-running process
-            // will receive our argv and focus its window. Exit non-zero so
-            // callers know this invocation didn't start anything new.
-            std::process::exit(1);
+            // The running process will receive a single-instance notification
+            // via the Tauri plugin and focus its window. We exit cleanly.
+            std::process::exit(0);
         }
     }
 
     let bundled = BundledAssets::resolve().map_err(|e| {
-        anyhow::anyhow!(
-            "runtime shim not found: {} (expected runtime-shim/ next to the binary)",
-            e
-        )
+        anyhow::anyhow!("runtime shim not found: {} (expected runtime-shim/ next to the binary)", e)
     })?;
 
     let state = Arc::new(AppState {
@@ -182,19 +178,26 @@ pub fn run() -> anyhow::Result<()> {
         bundled,
         child: Mutex::new(None),
         session: AtomicU64::new(0),
+        dev_mode,
+        cache_key: Mutex::new(String::new()),
+        env_approval_tx: Mutex::new(None),
     });
 
-    // Note: we intentionally do NOT use tauri-plugin-single-instance here.
-    // That plugin enforces *global* single-instance, but Phase 1 policy is
-    // one-per-canonical-script-path — so two Aperture windows for two
-    // different scripts must both run. The file lock in `lock.rs` is the
-    // portable, per-script baseline called for in the phase doc.
     tauri::Builder::default()
         .manage(state.clone())
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // Focus our window when a second launch of the same script happens.
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.set_focus();
+            }
+        }))
         .invoke_handler(tauri::generate_handler![
             frontend_ready,
             reload_script,
             send_to_child,
+            env_approve,
+            save_window_geometry,
+            open_log_file,
             invoke_cmds::aperture_file_picker,
             invoke_cmds::aperture_notification,
             invoke_cmds::aperture_open_external,
@@ -221,20 +224,34 @@ pub fn run() -> anyhow::Result<()> {
                     }
                 });
             }
+            // Persist window geometry on resize/move (debounce is handled on the
+            // frontend — it calls save_window_geometry after the 500 ms timeout).
         })
         .run(tauri::generate_context!())?;
 
     Ok(())
 }
 
+// ─────────────────────────────── Tauri commands ───────────────────────────────
+
 #[tauri::command]
 async fn frontend_ready(app: AppHandle, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
-    // Re-emit the launch details once the frontend has subscribed.
+    let cache_key = state.cache_key.lock().clone();
+    let geometry = if !cache_key.is_empty() {
+        config::WindowGeometry::load(&state.layout.windows, &cache_key)
+    } else {
+        None
+    };
+
     let msg = BackendMessage::Launch {
         source: state.args.source.as_display(),
         cwd: state.args.cwd.display().to_string(),
         raw_flags: state.args.raw_flags.clone(),
         offline: state.args.offline,
+        dev_mode: state.dev_mode,
+        persisted_geometry: geometry.map(|g| serde_json::json!({
+            "width": g.width, "height": g.height, "x": g.x, "y": g.y
+        })),
     };
     emit(&app, &msg);
     Ok(())
@@ -242,8 +259,6 @@ async fn frontend_ready(app: AppHandle, state: tauri::State<'_, Arc<AppState>>) 
 
 #[tauri::command]
 async fn reload_script(app: AppHandle, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
-    // Bump the session counter first so the old drive loop suppresses its
-    // final ChildExit emission instead of leaking it as a crash.
     state.session.fetch_add(1, Ordering::SeqCst);
     {
         let child = { state.child.lock().take() };
@@ -258,9 +273,6 @@ async fn reload_script(app: AppHandle, state: tauri::State<'_, Arc<AppState>>) -
     Ok(())
 }
 
-/// Forward a single GUIEvent JSON value into the running child's stdin as
-/// one NDJSON line. The frontend uses this to deliver `state:set`,
-/// `state:changed`, `cancel`, and (in Phase 4+) `invoke:result` events.
 #[tauri::command]
 async fn send_to_child(
     state: tauri::State<'_, Arc<AppState>>,
@@ -277,39 +289,147 @@ async fn send_to_child(
     handle.send_line(&line).await.map_err(|e| e.to_string())
 }
 
+/// Called by the frontend when the user approves/denies env-var access.
+#[tauri::command]
+async fn env_approve(
+    state: tauri::State<'_, Arc<AppState>>,
+    approved: bool,
+    vars: Vec<String>,
+) -> Result<(), String> {
+    if approved {
+        // Persist approval to config.
+        let mut cfg = config::ApertureConfig::load(&state.layout.config_json);
+        let cache_key = state.cache_key.lock().clone();
+        cfg.approve(&cache_key, vars);
+        let _ = cfg.save(&state.layout.config_json);
+    }
+    let tx = state.env_approval_tx.lock().take();
+    if let Some(tx) = tx {
+        let _ = tx.send(approved);
+    }
+    Ok(())
+}
+
+/// Called by the frontend after a debounced resize/move event.
+#[tauri::command]
+async fn save_window_geometry(
+    state: tauri::State<'_, Arc<AppState>>,
+    width: f64,
+    height: f64,
+    x: f64,
+    y: f64,
+) -> Result<(), String> {
+    let cache_key = state.cache_key.lock().clone();
+    if cache_key.is_empty() {
+        return Ok(());
+    }
+    let geom = config::WindowGeometry { width, height, x, y };
+    geom.save(&state.layout.windows, &cache_key)
+        .map_err(|e| e.to_string())
+}
+
+/// Opens the current script's log file with the OS default application.
+#[tauri::command]
+async fn open_log_file(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+    let cache_key = state.cache_key.lock().clone();
+    if cache_key.is_empty() {
+        return Err("no cache key — log file unavailable".into());
+    }
+    let log_path = state.layout.logs.join(format!("{}.log", cache_key));
+    if !log_path.exists() {
+        return Err(format!("log file not found: {}", log_path.display()));
+    }
+    open::that(&log_path).map_err(|e| e.to_string())
+}
+
+// ─────────────────────────────── lifecycle ────────────────────────────────────
+
 async fn lifecycle_entry(app: AppHandle, state: Arc<AppState>) {
     let session = state.session.fetch_add(1, Ordering::SeqCst) + 1;
     emit(&app, &BackendMessage::Phase { phase: Phase::Installing });
 
-    // Phase 1 treats every launch as first-run for the install screen —
-    // we dismiss after a short fixed delay once the child is ready. Phase 6
-    // replaces this with the real bun dep install pipeline.
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-
-    let script_path = match state.args.source.local_path() {
-        Some(p) => p.to_path_buf(),
-        None => {
-            emit_if_current(
-                &app,
-                &state,
-                session,
-                &BackendMessage::Fatal {
-                    message: "Remote scripts are not supported until Phase 6.".to_string(),
-                    stack: None,
-                },
-            );
-            return;
-        }
+    // ── Resolve the script path (download if remote) ───────────────────────────
+    let script_path = match resolve_script(&app, &state, session).await {
+        Some(p) => p,
+        None => return, // error already emitted
     };
 
-    let cli_flags_json =
-        serde_json::to_string(&state.args.raw_flags).unwrap_or_else(|_| "{}".to_string());
+    // ── Parse deps + env from script header ────────────────────────────────────
+    let script_deps = deps::parse_deps_from_script(&script_path);
+    let script_env = config::parse_env_from_script(&script_path);
 
+    // ── Compute / store cache key ──────────────────────────────────────────────
     let cache_key = cache_key::derive(&script_path)
         .ok()
         .flatten()
         .unwrap_or_default();
+    *state.cache_key.lock() = cache_key.clone();
 
+    // ── Env-var approval ───────────────────────────────────────────────────────
+    if !script_env.is_empty() {
+        let cfg = config::ApertureConfig::load(&state.layout.config_json);
+        if !cfg.is_approved(&cache_key, &script_env) {
+            // Ask the frontend to show the approval dialog.
+            let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+            *state.env_approval_tx.lock() = Some(tx);
+            emit_if_current(
+                &app,
+                &state,
+                session,
+                &BackendMessage::EnvApproval {
+                    vars: script_env.clone(),
+                    cache_key: cache_key.clone(),
+                },
+            );
+            match rx.await {
+                Ok(true) => {} // approved — continue
+                Ok(false) | Err(_) => {
+                    emit_if_current(
+                        &app,
+                        &state,
+                        session,
+                        &BackendMessage::Fatal {
+                            message: "Env-var access denied by user.".to_string(),
+                            stack: None,
+                        },
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    // ── Dep install ────────────────────────────────────────────────────────────
+    if !script_deps.is_empty() {
+        emit_if_current(
+            &app,
+            &state,
+            session,
+            &BackendMessage::InstallProgress {
+                label: "Installing dependencies…".to_string(),
+            },
+        );
+        match deps::ensure_deps(&state.layout.deps, &script_deps).await {
+            Ok(_) => {}
+            Err(e) => {
+                emit_if_current(
+                    &app,
+                    &state,
+                    session,
+                    &BackendMessage::Fatal {
+                        message: format!("Dependency install failed:\n{e}"),
+                        stack: None,
+                    },
+                );
+                return;
+            }
+        }
+    }
+
+    // ── Build approved env map ─────────────────────────────────────────────────
+    let approved_env = config::build_approved_env(&script_env);
+
+    // ── Node binary ───────────────────────────────────────────────────────────
     let node_bin = match resolve_node() {
         Ok(p) => p,
         Err(err) => {
@@ -318,12 +438,31 @@ async fn lifecycle_entry(app: AppHandle, state: Arc<AppState>) {
                 &state,
                 session,
                 &BackendMessage::Fatal {
-                    message: format!("Could not find Node.js on PATH: {err}. Phase 6 will bundle Node via Bun."),
+                    message: format!(
+                        "Could not find Node.js on PATH: {err}. Phase 6 bundles Node via Bun."
+                    ),
                     stack: None,
                 },
             );
             return;
         }
+    };
+
+    // ── Extra NODE_PATH for shared deps ───────────────────────────────────────
+    let mut node_paths = state.bundled.node_paths.clone();
+    let shared_nm = state.layout.deps.join("node_modules");
+    if shared_nm.is_dir() {
+        node_paths.push(shared_nm);
+    }
+
+    let cli_flags_json =
+        serde_json::to_string(&state.args.raw_flags).unwrap_or_else(|_| "{}".to_string());
+
+    // ── Log file path ─────────────────────────────────────────────────────────
+    let log_path = if !cache_key.is_empty() {
+        Some(state.layout.logs.join(format!("{}.log", cache_key)))
+    } else {
+        None
     };
 
     let cfg = SpawnConfig {
@@ -334,9 +473,12 @@ async fn lifecycle_entry(app: AppHandle, state: Arc<AppState>) {
         cwd: state.args.cwd.clone(),
         cli_flags_json,
         source: state.args.source.as_display(),
-        cache_key,
+        cache_key: cache_key.clone(),
         state_dir: state.layout.state.clone(),
-        node_paths: state.bundled.node_paths.clone(),
+        node_paths,
+        approved_env,
+        dev_mode: state.dev_mode,
+        log_path,
     };
 
     let Spawned { handle, events } = match child::spawn(cfg) {
@@ -364,6 +506,59 @@ async fn lifecycle_entry(app: AppHandle, state: Arc<AppState>) {
     drive(app, state, session, events).await;
 }
 
+/// Resolve the local path for the script — downloading from remote URL if needed.
+async fn resolve_script(app: &AppHandle, state: &Arc<AppState>, session: u64) -> Option<PathBuf> {
+    match &state.args.source {
+        cli::ScriptSource::LocalPath(p) => Some(p.clone()),
+        cli::ScriptSource::RemoteUrl(raw_url) => {
+            let canonical = state.args.source.canonical_identity();
+            emit_if_current(
+                app,
+                state,
+                session,
+                &BackendMessage::InstallProgress {
+                    label: "Downloading script…".to_string(),
+                },
+            );
+            match remote::resolve_remote(
+                raw_url,
+                &canonical,
+                &state.layout.scripts,
+                state.args.offline,
+            )
+            .await
+            {
+                Ok(remote::FetchOutcome::CacheHit { script_path, cache_key }) => {
+                    tracing::info!("cache hit: {}", cache_key);
+                    Some(script_path)
+                }
+                Ok(remote::FetchOutcome::Downloaded { script_path, cache_key }) => {
+                    tracing::info!("downloaded: {}", cache_key);
+                    Some(script_path)
+                }
+                Ok(remote::FetchOutcome::Uncached { script_path }) => {
+                    tracing::info!("uncached remote script (no @aperture-version)");
+                    Some(script_path)
+                }
+                Err(e) => {
+                    emit_if_current(
+                        app,
+                        state,
+                        session,
+                        &BackendMessage::Fatal {
+                            message: format!("Failed to fetch script: {e}"),
+                            stack: None,
+                        },
+                    );
+                    None
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────── drive loop ───────────────────────────────────
+
 async fn drive(
     app: AppHandle,
     state: Arc<AppState>,
@@ -373,13 +568,16 @@ async fn drive(
     let mut chunks = ChunkBuffers::new();
     while let Some(ev) = events.recv().await {
         if state.session.load(Ordering::SeqCst) != session {
-            // Superseded by a reload. Keep draining the channel so the old
-            // child's pipes close cleanly, but drop any further frontend
-            // emissions on the floor.
             continue;
         }
         match ev {
             HostEvent::Stdout(value) => {
+                if state.dev_mode {
+                    emit(&app, &BackendMessage::ProtocolEvent {
+                        direction: "inbound".to_string(),
+                        event: value.clone(),
+                    });
+                }
                 route_script_event(&app, &mut chunks, value);
             }
             HostEvent::ParseError { line, error } => {
@@ -395,6 +593,7 @@ async fn drive(
                         code,
                         signal,
                         stderr_tail,
+                        log_available: has_log(&state),
                     },
                 );
                 break;
@@ -403,8 +602,12 @@ async fn drive(
     }
 }
 
-/// Reassemble `state:set:chunk` frames into a single `state:set` for the
-/// frontend, forward every other script event verbatim.
+fn has_log(state: &AppState) -> bool {
+    let ck = state.cache_key.lock().clone();
+    if ck.is_empty() { return false; }
+    state.layout.logs.join(format!("{}.log", ck)).exists()
+}
+
 fn route_script_event(app: &AppHandle, chunks: &mut ChunkBuffers, value: Value) {
     let ty = value.get("type").and_then(Value::as_str).unwrap_or("");
     match ty {
@@ -427,13 +630,7 @@ fn route_script_event(app: &AppHandle, chunks: &mut ChunkBuffers, value: Value) 
             if let Some(key) = value.get("key").and_then(Value::as_str) {
                 chunks.drop_pending(key);
                 let v = value.get("value").cloned().unwrap_or(Value::Null);
-                emit(
-                    app,
-                    &BackendMessage::StateSet {
-                        key: key.to_string(),
-                        value: v,
-                    },
-                );
+                emit(app, &BackendMessage::StateSet { key: key.to_string(), value: v });
                 return;
             }
             emit(app, &BackendMessage::Script { event: value });
@@ -457,22 +654,5 @@ fn emit(app: &AppHandle, msg: &BackendMessage) {
 }
 
 fn resolve_node() -> std::io::Result<PathBuf> {
-    if let Ok(p) = std::env::var("APERTURE_NODE") {
-        return Ok(PathBuf::from(p));
-    }
-    // Search PATH for `node` (or `node.exe` on Windows).
-    let exe = if cfg!(windows) { "node.exe" } else { "node" };
-    let path = std::env::var_os("PATH").ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "PATH is not set")
-    })?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(exe);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "`node` not found on PATH",
-    ))
+    subcommands::resolve_node()
 }

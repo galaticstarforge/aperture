@@ -1,11 +1,13 @@
-// Phase 4 child-process bootstrap.
+// Phase 6 child-process bootstrap.
 //
-// Responsibilities layered on top of Phase 2/3:
+// Responsibilities:
 //   - Route `invoke:result` / `invoke:stream` stdin messages to shim resolvers
 //   - Route `format:request` stdin messages to the shim formatter handler
 //   - Wire `call` handler with `meta.returnsInto` auto-write
 //   - Propagate `cancel` reason through to __abort
 //   - Extract `timeoutMs` from user module; arm a Node timeout if set
+//   - Headless mode: APERTURE_HEADLESS=1 — calls headless() instead of onLoad,
+//     skips GUI manifest emission, headless-incompatible invokes throw 'not-available-headless'
 //
 // Invocation shape (from the Tauri backend):
 //
@@ -19,6 +21,8 @@
 //   APERTURE_CLI_FLAGS  — JSON object of CLI --flag value pairs (raw strings)
 //   APERTURE_CACHE_KEY  — string; empty when the script has no @aperture-version
 //   APERTURE_STATE_DIR  — absolute path to `~/.aperture/state/`
+//   APERTURE_HEADLESS   — "1" when running via `aperture run` (no GUI)
+//   APERTURE_DEV        — "1" when running via `aperture dev` (verbose tracing)
 
 import { pathToFileURL } from 'node:url'
 import { createInterface } from 'node:readline'
@@ -56,6 +60,8 @@ const rawCliFlags = safeJson(process.env.APERTURE_CLI_FLAGS) ?? {}
 const rawSource = process.env.APERTURE_SOURCE ?? scriptArg
 const cacheKey = (process.env.APERTURE_CACHE_KEY ?? '').trim()
 const stateDir = process.env.APERTURE_STATE_DIR ?? ''
+const IS_HEADLESS = process.env.APERTURE_HEADLESS === '1'
+const IS_DEV = process.env.APERTURE_DEV === '1'
 
 // --- import the user script --------------------------------------------------
 
@@ -137,61 +143,86 @@ const store = new StateStore({
 
 runtime.__installStore(store)
 
-// --- emit manifest event -----------------------------------------------------
+// --- headless invoke guard ---------------------------------------------------
+// In headless mode, GUI-dependent invoke targets throw 'not-available-headless'.
+if (IS_HEADLESS) {
+  const GUI_ONLY = new Set(['filePicker', 'confirm', 'prompt', 'notification'])
+  const origInvoke = runtime.invoke
+  // Replace the invoke export with a guarded version. Because shim exports are
+  // live bindings we use the internal __installHeadlessGuard hook if available,
+  // otherwise we patch via Object.defineProperty on the module namespace.
+  // Since we can't reassign named exports from outside, we wrap at call sites
+  // by patching the runtime object's prototype chain. The simplest approach:
+  // override runtime.invoke by shadowing it on the runtime namespace object.
+  Object.defineProperty(runtime, 'invoke', {
+    configurable: true,
+    writable: true,
+    value: function headlessInvoke(fn, args) {
+      if (GUI_ONLY.has(fn)) {
+        return Promise.reject(new Error('not-available-headless'))
+      }
+      return origInvoke(fn, args)
+    },
+  })
+}
+
+// --- emit manifest event (GUI only) ------------------------------------------
 
 const currentStateSnapshot = () => Object.fromEntries(store.values)
 
-const isUiFn = typeof manifest.ui === 'function'
-const initialUiTree = isUiFn
-  ? (() => {
-      try {
-        return manifest.ui(currentStateSnapshot(), paramsResult.data)
-      } catch {
-        return {}
-      }
-    })()
-  : manifest.ui
+if (!IS_HEADLESS) {
+  const isUiFn = typeof manifest.ui === 'function'
+  const initialUiTree = isUiFn
+    ? (() => {
+        try {
+          return manifest.ui(currentStateSnapshot(), paramsResult.data)
+        } catch {
+          return {}
+        }
+      })()
+    : manifest.ui
 
-emit({
-  type: 'manifest',
-  ui: initialUiTree,
-  window: manifest.window,
-  callbacks: Object.keys(manifest.callbacks),
-  formatters: Object.keys(manifest.formatters ?? {}),
-  timeoutMs: typeof manifest.timeoutMs === 'number' ? manifest.timeoutMs : null,
-})
+  emit({
+    type: 'manifest',
+    ui: initialUiTree,
+    window: manifest.window,
+    callbacks: Object.keys(manifest.callbacks),
+    formatters: Object.keys(manifest.formatters ?? {}),
+    timeoutMs: typeof manifest.timeoutMs === 'number' ? manifest.timeoutMs : null,
+    env: manifest.env ?? [],
+    deps: manifest.deps ?? [],
+  })
 
-// Register logTarget keys from the initial UI tree so runtime.log() routes
-// log events to those state keys (for timeline elements with logTarget).
-for (const key of collectLogTargets(initialUiTree ?? {})) {
-  runtime.__addLogTarget(key)
-}
-
-// For function-form ui, re-emit the tree on any state change via a debounced
-// microtask so rapid multi-key writes collapse into one emission.
-if (isUiFn) {
-  let uiUpdatePending = false
-  const scheduleUiUpdate = () => {
-    if (uiUpdatePending) return
-    uiUpdatePending = true
-    queueMicrotask(() => {
-      uiUpdatePending = false
-      try {
-        emit({ type: 'ui:update', tree: manifest.ui(currentStateSnapshot(), paramsResult.data) })
-      } catch {
-        // Swallow — a bad ui function shouldn't crash the process.
-      }
-    })
+  // Register logTarget keys from the initial UI tree.
+  for (const key of collectLogTargets(initialUiTree ?? {})) {
+    runtime.__addLogTarget(key)
   }
-  if (manifest.state) {
-    const shape =
-      typeof manifest.state._def?.shape === 'function'
-        ? manifest.state._def.shape()
-        : typeof manifest.state.shape === 'function'
-          ? manifest.state.shape()
-          : manifest.state._def?.shape ?? {}
-    for (const key of Object.keys(shape ?? {})) {
-      store.watch(key, scheduleUiUpdate)
+
+  // For function-form ui, re-emit the tree on any state change.
+  if (isUiFn) {
+    let uiUpdatePending = false
+    const scheduleUiUpdate = () => {
+      if (uiUpdatePending) return
+      uiUpdatePending = true
+      queueMicrotask(() => {
+        uiUpdatePending = false
+        try {
+          emit({ type: 'ui:update', tree: manifest.ui(currentStateSnapshot(), paramsResult.data) })
+        } catch {
+          // Swallow — a bad ui function shouldn't crash the process.
+        }
+      })
+    }
+    if (manifest.state) {
+      const shape =
+        typeof manifest.state._def?.shape === 'function'
+          ? manifest.state._def.shape()
+          : typeof manifest.state.shape === 'function'
+            ? manifest.state.shape()
+            : manifest.state._def?.shape ?? {}
+      for (const key of Object.keys(shape ?? {})) {
+        store.watch(key, scheduleUiUpdate)
+      }
     }
   }
 }
@@ -331,8 +362,27 @@ rl.on('close', () => {
   void callOnExit('window-close')
 })
 
-// --- onLoad ------------------------------------------------------------------
+// --- onLoad / headless entry -------------------------------------------------
 
+if (IS_HEADLESS) {
+  // Headless mode: call headless(params, runtime) and exit.
+  if (typeof manifest.headless !== 'function') {
+    emitError(
+      'Script has no `headless` export — add `export async function headless(params, runtime) {}`',
+    )
+    process.exit(1)
+  }
+  try {
+    const result = await manifest.headless(runtime.params, runtime)
+    emit({ type: 'result', data: result === undefined ? null : result })
+  } catch (err) {
+    emitError(err?.message ?? String(err), err?.stack)
+    process.exit(1)
+  }
+  process.exit(0)
+}
+
+// GUI mode: run onLoad then mirror initial state to the frontend.
 if (manifest.onLoad) {
   try {
     const result = await manifest.onLoad(runtime.params, runtime)

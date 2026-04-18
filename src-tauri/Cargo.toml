@@ -1,7 +1,7 @@
 [package]
 name = "aperture"
-version = "0.1.0"
-description = "Aperture — GUI-native .mjs script runner (Phase 1)"
+version = "0.6.0"
+description = "Aperture — GUI-native .mjs script runner"
 edition = "2021"
 rust-version = "1.77"
 
@@ -14,6 +14,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
@@ -32,6 +33,8 @@ once_cell = "1"
 rfd = { version = "0.14", features = ["tokio"] }
 arboard = { version = "3", default-features = false }
 open = "5"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+bytes = "1"
 
 [features]
 # Default feature set mirrors tauri defaults; custom protocol is not needed in phase 1.
