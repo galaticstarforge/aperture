@@ -29,6 +29,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1"
 once_cell = "1"
+rfd = { version = "0.14", features = ["tokio"] }
+arboard = { version = "3", default-features = false }
+open = "5"
 
 [features]
 # Default feature set mirrors tauri defaults; custom protocol is not needed in phase 1.

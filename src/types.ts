@@ -11,23 +11,25 @@ export type WindowConfig = {
 }
 
 export type ScriptEvent =
-  | { type: 'progress';        value: number; label?: string }
-  | { type: 'log';             level: 'info' | 'warn' | 'error'; message: string; data?: unknown; source?: string }
-  | { type: 'state:set';       key: string; value: unknown }
-  | { type: 'state:set:chunk'; key: string; chunk: string; final: boolean }
-  | { type: 'state:get';       key: string; callId: string }
-  | { type: 'invoke';          fn: string; args: unknown; callId: string; stream?: boolean }
-  | { type: 'result';          data: unknown }
-  | { type: 'error';           message: string; stack?: string }
-  | { type: 'manifest';        ui: unknown; window: WindowConfig; callbacks: string[] }
-  | { type: 'ui:update';       tree: unknown }
+  | { type: 'progress';         value: number; label?: string }
+  | { type: 'log';              level: 'info' | 'warn' | 'error'; message: string; data?: unknown; source?: string }
+  | { type: 'state:set';        key: string; value: unknown }
+  | { type: 'state:set:chunk';  key: string; chunk: string; final: boolean }
+  | { type: 'state:get';        key: string; callId: string }
+  | { type: 'invoke';           fn: string; args: unknown; callId: string; stream?: boolean }
+  | { type: 'format:result';    callId: string; result?: unknown; error?: string }
+  | { type: 'result';           data: unknown }
+  | { type: 'error';            message: string; stack?: string }
+  | { type: 'manifest';         ui: unknown; window: WindowConfig; callbacks: string[]; formatters: string[]; timeoutMs: number | null }
+  | { type: 'ui:update';        tree: unknown }
 
 export type GUIEvent =
   | { type: 'state:set';       key: string; value: unknown }
   | { type: 'state:changed';   key: string; value: unknown }
   | { type: 'state:get:reply'; callId: string; value: unknown }
-  | { type: 'invoke:result';   callId: string; result: unknown }
-  | { type: 'invoke:stream';   callId: string; chunk: unknown; final: boolean }
+  | { type: 'invoke:result';   callId: string; result?: unknown; error?: string }
+  | { type: 'invoke:stream';   callId: string; chunk: unknown; final: boolean; error?: string }
+  | { type: 'format:request';  callId: string; name: string; value: unknown; context: unknown }
   | { type: 'call';            fn: string; args: unknown; callId: string }
   | { type: 'cancel';          reason?: string }
 
@@ -44,3 +46,14 @@ export type BackendMessage =
   | { kind: 'parse-error'; line: string; error: string }
   | { kind: 'child-exit';  code: number | null; signal: string | null; stderrTail: string }
   | { kind: 'fatal';       message: string; stack?: string }
+
+// Invoke confirm/prompt modal request shapes.
+export type InvokeRequest =
+  | { fn: 'confirm';     args: { message: string };                  callId: string }
+  | { fn: 'prompt';      args: { message: string };                  callId: string }
+  | { fn: 'filePicker';  args: { mode?: string; filter?: string; recursive?: boolean }; callId: string }
+  | { fn: 'notification'; args: { title: string; body?: string; level?: string }; callId: string }
+  | { fn: 'openExternal'; args: { url: string; newWindow?: boolean }; callId: string }
+  | { fn: 'clipboard';   args: { op: 'read' | 'write'; text?: string }; callId: string }
+
+export type ProgressState = { value: number; label?: string } | null

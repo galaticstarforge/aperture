@@ -1,18 +1,16 @@
 // `aperture:runtime` — virtual module shim.
 //
-// Phase 2 surface:
-//   - `progress`, `log`        — real (NDJSON over stdout)
-//   - `state`                  — real reactive store (set/get/setIn/push/
-//                                watch/persist); backed by a StateStore
-//                                instance installed by the bootstrap
-//   - `params`                 — frozen launch-time snapshot set by bootstrap
-//   - `signal`                 — AbortSignal wired to cancel/exit
-//   - `invoke`, `invokeStream`, `on`, `createWorker` — stubs that throw,
-//     landing in Phases 4/5.
+// Phase 4 surface:
+//   - `invoke(fn, args)`        — real; emits invoke event, awaits invoke:result
+//   - `invokeStream(fn, args)`  — real; async generator over invoke:stream chunks
+//   - `on`                      — stub (Phase 5)
+//   - `createWorker`            — stub (Phase 5)
 //
-// The shim installs zod `.persist()` / `.stream()` prototype extensions at
-// load-time so user schemas written as `z.string().persist()` work without
-// any extra import.
+// Earlier surfaces remain unchanged:
+//   - `progress`, `log`         — real (NDJSON over stdout)
+//   - `state`                   — real reactive store
+//   - `params`                  — frozen launch-time snapshot
+//   - `signal`                  — AbortSignal wired to cancel/exit
 
 import './schema-markers.mjs'
 import { install as installSchemaMarkers } from './schema-markers.mjs'
@@ -20,7 +18,6 @@ import { install as installSchemaMarkers } from './schema-markers.mjs'
 installSchemaMarkers()
 
 function emit(event) {
-  // Writes one NDJSON line to stdout. The Tauri backend owns the pipe.
   const line = JSON.stringify(event)
   process.stdout.write(line + '\n')
 }
@@ -54,11 +51,6 @@ export function log(message, level = 'info', data) {
 
 let store = null
 
-/**
- * Installed once by the bootstrap after schema extraction + params validation.
- * The object returned by `state` delegates to this live store; calling state
- * methods before installation throws with a clear phase error.
- */
 export function __installStore(s) {
   store = s
 }
@@ -110,17 +102,181 @@ export function __abort(reason) {
   controller.abort(reason)
 }
 
-// --- stubbed: real behavior arrives in later phases --------------------------
+// Exposes the controller so Phase 5 worker harness can subscribe.
+export const __abortController = controller
 
-function notYet(name, phase) {
-  return () => {
-    throw new Error(
-      `aperture:runtime.${name} is not implemented yet — landing in Phase ${phase}.`,
-    )
+// --- invoke / invokeStream ---------------------------------------------------
+
+let _callSeq = 0
+function nextCallId() {
+  return `inv-${Date.now()}-${++_callSeq}`
+}
+
+// Pending invoke promises: callId → { resolve, reject }
+const _pendingInvokes = new Map()
+// Pending stream controllers: callId → { push(chunk, final), abort(err) }
+const _pendingStreams = new Map()
+
+export function __resolveInvoke(callId, result) {
+  const pending = _pendingInvokes.get(callId)
+  if (pending) {
+    _pendingInvokes.delete(callId)
+    pending.resolve(result)
   }
 }
 
-export const invoke = notYet('invoke', 4)
-export const invokeStream = notYet('invokeStream', 4)
-export const on = notYet('on', 4)
-export const createWorker = notYet('createWorker', 5)
+export function __rejectInvoke(callId, errorMsg) {
+  const pending = _pendingInvokes.get(callId)
+  if (pending) {
+    _pendingInvokes.delete(callId)
+    pending.reject(new Error(errorMsg))
+  }
+}
+
+export function __pushStreamChunk(callId, chunk, isFinal) {
+  const pending = _pendingStreams.get(callId)
+  if (pending) {
+    pending.push(chunk, isFinal)
+    if (isFinal) _pendingStreams.delete(callId)
+  }
+}
+
+export function __abortStream(callId, errorMsg) {
+  const pending = _pendingStreams.get(callId)
+  if (pending) {
+    _pendingStreams.delete(callId)
+    pending.abort(new Error(errorMsg))
+  }
+}
+
+export function invoke(fn, args = {}) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException(String(signal.reason ?? 'Aborted'), 'AbortError'))
+      return
+    }
+    const callId = nextCallId()
+    _pendingInvokes.set(callId, { resolve, reject })
+
+    const onAbort = () => {
+      if (_pendingInvokes.has(callId)) {
+        _pendingInvokes.delete(callId)
+        reject(new DOMException(String(signal.reason ?? 'Aborted'), 'AbortError'))
+      }
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+
+    emit({ type: 'invoke', fn, args, callId })
+  })
+}
+
+export async function* invokeStream(fn, args = {}) {
+  if (signal.aborted) {
+    throw new DOMException(String(signal.reason ?? 'Aborted'), 'AbortError')
+  }
+
+  const callId = nextCallId()
+
+  // Queue-based async generator: chunks arrive asynchronously via
+  // __pushStreamChunk; the generator waits on a Promise that is replaced
+  // each time the queue drains.
+  const queue = []
+  let done = false
+  let streamError = null
+  let notify = null   // resolves the current "wait for more" promise
+
+  _pendingStreams.set(callId, {
+    push(chunk, isFinal) {
+      queue.push(chunk)
+      if (isFinal) done = true
+      if (notify) { const n = notify; notify = null; n() }
+    },
+    abort(err) {
+      streamError = err
+      done = true
+      if (notify) { const n = notify; notify = null; n() }
+    },
+  })
+
+  const onAbort = () => {
+    if (_pendingStreams.has(callId)) {
+      _pendingStreams.delete(callId)
+      streamError = new DOMException(String(signal.reason ?? 'Aborted'), 'AbortError')
+      done = true
+      if (notify) { const n = notify; notify = null; n() }
+    }
+  }
+  signal.addEventListener('abort', onAbort, { once: true })
+
+  try {
+    emit({ type: 'invoke', fn, args, callId, stream: true })
+
+    while (!done || queue.length > 0) {
+      while (queue.length > 0) {
+        yield queue.shift()
+      }
+      if (!done) {
+        await new Promise((r) => { notify = r })
+      }
+    }
+
+    if (streamError) throw streamError
+  } finally {
+    signal.removeEventListener('abort', onAbort)
+    _pendingStreams.delete(callId)
+  }
+}
+
+// --- format request / result -------------------------------------------------
+// Custom formatters run in the child; the frontend dispatches format:request
+// and receives format:result.  Bootstrap routes these events.
+
+const _pendingFormats = new Map()  // callId → { resolve, reject }
+let _formatSeq = 0
+
+export function __resolveFormat(callId, result) {
+  const pending = _pendingFormats.get(callId)
+  if (pending) {
+    _pendingFormats.delete(callId)
+    pending.resolve(result)
+  }
+}
+
+export function __rejectFormat(callId, errorMsg) {
+  const pending = _pendingFormats.get(callId)
+  if (pending) {
+    _pendingFormats.delete(callId)
+    pending.reject(new Error(errorMsg))
+  }
+}
+
+// Called by bootstrap when a format:request arrives on stdin.
+export function __handleFormatRequest(name, value, context, callId, formatters) {
+  const fn = formatters?.[name]
+  if (!fn || typeof fn !== 'function') {
+    emit({ type: 'format:result', callId, error: `Unknown formatter: ${name}` })
+    return
+  }
+  Promise.resolve()
+    .then(() => fn(value, context))
+    .then((result) => emit({ type: 'format:result', callId, result }))
+    .catch((err) =>
+      emit({ type: 'format:result', callId, error: err?.message ?? String(err) }),
+    )
+}
+
+// --- on (Phase 5 stub) -------------------------------------------------------
+
+export function on() {
+  throw new Error(
+    `aperture:runtime.on is not implemented yet — landing in Phase 5.`,
+  )
+}
+
+// --- createWorker (Phase 5 stub) ---------------------------------------------
+
+export function createWorker() {
+  throw new Error(
+    `aperture:runtime.createWorker is not implemented yet — landing in Phase 5.`,
+  )
+}

@@ -1,5 +1,5 @@
-import { useState, useRef, useEffect } from 'react'
-import { ChevronDown, ChevronUp, Terminal } from 'lucide-react'
+import { useState, useRef, useEffect, useCallback } from 'react'
+import { ChevronDown, ChevronUp, ChevronRight, Terminal } from 'lucide-react'
 
 export type LogEntry = {
   id: number
@@ -26,6 +26,53 @@ const LEVEL_BADGE: Record<string, string> = {
 let idSeq = 0
 export function makeLogId(): number { return ++idSeq }
 
+function DataBlob({ data }: { data: unknown }) {
+  const [open, setOpen] = useState(false)
+  let preview: string
+  try {
+    preview = JSON.stringify(data)
+    if (preview.length > 60) preview = preview.slice(0, 57) + '…'
+  } catch {
+    preview = String(data)
+  }
+
+  return (
+    <span className="ap-log-entry__data-wrap">
+      <button
+        className="ap-log-entry__data-toggle ap-muted"
+        onClick={() => setOpen((o) => !o)}
+        title={open ? 'Collapse data' : 'Expand data'}
+      >
+        <ChevronRight
+          size={10}
+          style={{ transform: open ? 'rotate(90deg)' : undefined, transition: 'transform 0.1s' }}
+        />
+        {!open && <span className="ap-log-entry__data-preview">{preview}</span>}
+      </button>
+      {open && (
+        <pre className="ap-log-entry__data-json">
+          {JSON.stringify(data, null, 2)}
+        </pre>
+      )}
+    </span>
+  )
+}
+
+function LogEntry({ entry }: { entry: LogEntry }) {
+  return (
+    <div className="ap-log-entry">
+      <span
+        className="ap-log-entry__badge"
+        style={{ color: LEVEL_COLOR[entry.level] }}
+      >
+        {LEVEL_BADGE[entry.level]}
+      </span>
+      <span className="ap-log-entry__msg">{entry.message}</span>
+      {entry.data !== undefined && <DataBlob data={entry.data} />}
+    </div>
+  )
+}
+
 export function LogPanel({ entries }: { entries: LogEntry[] }) {
   const [open, setOpen] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -34,9 +81,11 @@ export function LogPanel({ entries }: { entries: LogEntry[] }) {
     if (open) bottomRef.current?.scrollIntoView({ block: 'end' })
   }, [entries, open])
 
+  const toggleOpen = useCallback(() => setOpen((o) => !o), [])
+
   return (
     <div className={`ap-log-panel${open ? ' ap-log-panel--open' : ''}`}>
-      <button className="ap-log-panel__toggle" onClick={() => setOpen((o) => !o)}>
+      <button className="ap-log-panel__toggle" onClick={toggleOpen}>
         <Terminal size={12} style={{ marginRight: 6 }} />
         <span>Logs</span>
         {entries.length > 0 && (
@@ -51,20 +100,7 @@ export function LogPanel({ entries }: { entries: LogEntry[] }) {
             <div className="ap-muted" style={{ padding: '8px 12px', fontSize: 12 }}>No log output yet.</div>
           )}
           {entries.map((e) => (
-            <div key={e.id} className="ap-log-entry">
-              <span
-                className="ap-log-entry__badge"
-                style={{ color: LEVEL_COLOR[e.level] }}
-              >
-                {LEVEL_BADGE[e.level]}
-              </span>
-              <span className="ap-log-entry__msg">{e.message}</span>
-              {e.data !== undefined && (
-                <span className="ap-log-entry__data ap-muted">
-                  {' '}{JSON.stringify(e.data)}
-                </span>
-              )}
-            </div>
+            <LogEntry key={e.id} entry={e} />
           ))}
           <div ref={bottomRef} />
         </div>

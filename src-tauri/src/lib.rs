@@ -18,6 +18,7 @@ pub mod chunks;
 pub mod cli;
 pub mod events;
 pub mod fs_layout;
+pub mod invoke_cmds;
 pub mod lock;
 pub mod ndjson;
 
@@ -193,7 +194,12 @@ pub fn run() -> anyhow::Result<()> {
         .invoke_handler(tauri::generate_handler![
             frontend_ready,
             reload_script,
-            send_to_child
+            send_to_child,
+            invoke_cmds::aperture_file_picker,
+            invoke_cmds::aperture_notification,
+            invoke_cmds::aperture_open_external,
+            invoke_cmds::aperture_clipboard_read,
+            invoke_cmds::aperture_clipboard_write,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
