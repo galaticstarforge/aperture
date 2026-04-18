@@ -159,7 +159,7 @@ export default function App() {
           setView((prev) => (prev.kind === 'installing' ? { kind: 'running' } : prev))
           return
         case 'log':
-          pushLog({ level: event.level, message: event.message, data: event.data })
+          pushLog({ level: event.level, message: event.message, data: event.data, source: event.source })
           return
         case 'progress':
           setProgress({ value: event.value, label: event.label })
@@ -180,6 +180,14 @@ export default function App() {
           // eslint-disable-next-line no-console
           console.warn('[script:event] unexpected raw state:set:chunk', event)
           return
+        case 'state:get': {
+          // Worker requesting state from main thread via GUI bridge.
+          const value = stateBridge.get((event as { key: string }).key)
+          void tauriInvoke('send_to_child', {
+            event: { type: 'state:get:reply', callId: (event as { callId: string }).callId, value },
+          }).catch(() => {})
+          return
+        }
         case 'invoke':
           // Script is requesting an OS-level primitive.
           void handleInvoke(event as unknown as InvokeRequest)

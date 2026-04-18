@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import { ChevronDown, ChevronUp, ChevronRight, Terminal } from 'lucide-react'
 
 export type LogEntry = {
@@ -7,6 +7,7 @@ export type LogEntry = {
   message: string
   data?: unknown
   timestamp: number
+  source?: string
 }
 
 const LEVEL_COLOR: Record<string, string> = {
@@ -58,7 +59,7 @@ function DataBlob({ data }: { data: unknown }) {
   )
 }
 
-function LogEntry({ entry }: { entry: LogEntry }) {
+function LogEntryRow({ entry }: { entry: LogEntry }) {
   return (
     <div className="ap-log-entry">
       <span
@@ -67,6 +68,9 @@ function LogEntry({ entry }: { entry: LogEntry }) {
       >
         {LEVEL_BADGE[entry.level]}
       </span>
+      {entry.source && entry.source !== 'main' && (
+        <span className="ap-log-entry__source ap-muted">[{entry.source}]</span>
+      )}
       <span className="ap-log-entry__msg">{entry.message}</span>
       {entry.data !== undefined && <DataBlob data={entry.data} />}
     </div>
@@ -75,6 +79,7 @@ function LogEntry({ entry }: { entry: LogEntry }) {
 
 export function LogPanel({ entries }: { entries: LogEntry[] }) {
   const [open, setOpen] = useState(false)
+  const [sourceFilter, setSourceFilter] = useState<string>('all')
   const bottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -82,6 +87,21 @@ export function LogPanel({ entries }: { entries: LogEntry[] }) {
   }, [entries, open])
 
   const toggleOpen = useCallback(() => setOpen((o) => !o), [])
+
+  const sources = useMemo(() => {
+    const seen = new Set<string>(['main'])
+    for (const e of entries) {
+      if (e.source && e.source !== 'main') seen.add(e.source)
+    }
+    return Array.from(seen)
+  }, [entries])
+
+  const visible = useMemo(
+    () => sourceFilter === 'all' ? entries : entries.filter((e) => (e.source ?? 'main') === sourceFilter),
+    [entries, sourceFilter],
+  )
+
+  const multiSource = sources.length > 1
 
   return (
     <div className={`ap-log-panel${open ? ' ap-log-panel--open' : ''}`}>
@@ -96,11 +116,25 @@ export function LogPanel({ entries }: { entries: LogEntry[] }) {
 
       {open && (
         <div className="ap-log-panel__body">
-          {entries.length === 0 && (
+          {multiSource && (
+            <div className="ap-log-panel__source-filter">
+              <select
+                value={sourceFilter}
+                onChange={(e) => setSourceFilter(e.target.value)}
+                className="ap-log-panel__source-select"
+              >
+                <option value="all">All sources</option>
+                {sources.map((s) => (
+                  <option key={s} value={s}>{s}</option>
+                ))}
+              </select>
+            </div>
+          )}
+          {visible.length === 0 && (
             <div className="ap-muted" style={{ padding: '8px 12px', fontSize: 12 }}>No log output yet.</div>
           )}
-          {entries.map((e) => (
-            <LogEntry key={e.id} entry={e} />
+          {visible.map((e) => (
+            <LogEntryRow key={e.id} entry={e} />
           ))}
           <div ref={bottomRef} />
         </div>

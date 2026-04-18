@@ -15,10 +15,12 @@
     "test": "npm run test:shim"
   },
   "dependencies": {
+    "@tanstack/react-virtual": "^3.10.0",
     "@tauri-apps/api": "^2.0.0",
     "lucide-react": "^0.400.0",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",
+    "recharts": "^2.13.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {

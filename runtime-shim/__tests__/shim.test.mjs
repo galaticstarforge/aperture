@@ -380,13 +380,23 @@ test('invoke rejects immediately when signal is already aborted', async () => {
 })
 
 // ---------------------------------------------------------------------------
-// Phase-stub functions
+// Phase 5: on() and createWorker() are now fully implemented.
 // ---------------------------------------------------------------------------
 
-test('on throws not-yet error', () => {
-  assert.throws(() => on(), /Phase 5/)
+test('on() throws TypeError for non-string event', () => {
+  assert.throws(() => on(42, () => {}), /TypeError/)
 })
 
-test('createWorker throws Phase 5 not-yet error', () => {
-  assert.throws(() => createWorker(), /Phase 5/)
+test('on() throws TypeError for non-function handler', () => {
+  assert.throws(() => on('event', 'not-a-function'), /TypeError/)
+})
+
+test('on() returns an unsubscribe function', () => {
+  const off = on('test:event', () => {})
+  assert.equal(typeof off, 'function')
+  off() // should not throw
+})
+
+test('createWorker() throws TypeError when fn is not a function', () => {
+  assert.throws(() => createWorker('not-a-function'), /TypeError/)
 })

@@ -16,6 +16,16 @@ export function nextCallId(): string {
 
 export function makeDispatch(): DispatchFn {
   return async (fn: string, args: unknown = {}) => {
+    // __stateSet is an internal UI action: update a state key directly.
+    if (fn === '__stateSet') {
+      const { key, value } = args as { key: string; value: unknown }
+      await tauriInvoke('send_to_child', {
+        event: { type: 'state:changed', key, value },
+      }).catch((err) => {
+        console.warn('[dispatch] state:changed failed', err)
+      })
+      return
+    }
     const callId = nextCallId()
     await tauriInvoke('send_to_child', {
       event: { type: 'call', fn, args, callId },
