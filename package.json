@@ -9,7 +9,10 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test:shim": "node --test runtime-shim/__tests__/*.test.mjs"
+    "test:shim": "node --test runtime-shim/__tests__/*.test.mjs",
+    "test:shim:watch": "node --test --watch runtime-shim/__tests__/*.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run test:shim"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
