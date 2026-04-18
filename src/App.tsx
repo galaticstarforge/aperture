@@ -2,29 +2,43 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { invoke as tauriInvoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import type { BackendMessage, InvokeRequest, ProgressState, ScriptEvent, WindowConfig } from './types'
+import type { BackendMessage, InvokeRequest, ProgressState, ScriptEvent, WindowConfig, WindowGeometry } from './types'
 import { InstallScreen } from './screens/InstallScreen'
 import { RunningScreen } from './screens/RunningScreen'
 import { DeathScreen, type DeathInfo } from './screens/DeathScreen'
+import { EnvApprovalScreen } from './screens/EnvApprovalScreen'
 import { stateBridge, installDevHandle } from './state-bridge'
 import { type LogEntry, makeLogId } from './ui/LogPanel'
 import { type ModalRequest } from './ui/InvokeModal'
+import { ProtocolInspector, type ProtocolEntry, makeProtocolId } from './ui/ProtocolInspector'
 import type { UiNode } from './ui/types'
 import { resolveFormatResult, registerCustomFormatters } from './ui/formatters'
 
 type View =
   | { kind: 'installing'; label: string }
+  | { kind: 'env-approval'; vars: string[]; cacheKey: string }
   | { kind: 'running' }
   | { kind: 'dead'; info: DeathInfo }
 
-async function applyWindowConfig(cfg: WindowConfig, scriptSource: string) {
+async function applyWindowConfig(
+  cfg: WindowConfig,
+  scriptSource: string,
+  persisted: WindowGeometry | null | undefined,
+) {
   const win = getCurrentWindow()
   const title = cfg.title ?? scriptSource.split('/').pop()?.replace(/\.mjs$/, '') ?? 'Aperture'
   try {
     await win.setTitle(title)
-    if (cfg.width && cfg.height) {
+    // Persisted geometry wins over script defaults (Phase 6 §"Window persistence").
+    const w = persisted?.width ?? cfg.width
+    const h = persisted?.height ?? cfg.height
+    if (w && h) {
       const { LogicalSize } = await import('@tauri-apps/api/dpi')
-      await win.setSize(new LogicalSize(cfg.width, cfg.height))
+      await win.setSize(new LogicalSize(w, h))
+    }
+    if (persisted?.x !== undefined && persisted?.y !== undefined) {
+      const { LogicalPosition } = await import('@tauri-apps/api/dpi')
+      await win.setPosition(new LogicalPosition(persisted.x, persisted.y))
     }
     if (cfg.resizable !== undefined) await win.setResizable(cfg.resizable)
     if (cfg.minWidth && cfg.minHeight) {
@@ -37,7 +51,6 @@ async function applyWindowConfig(cfg: WindowConfig, scriptSource: string) {
   }
 }
 
-// Send an invoke:result back to the child process.
 async function sendInvokeResult(callId: string, result?: unknown, error?: string) {
   const event = error
     ? { type: 'invoke:result', callId, error }
@@ -55,9 +68,55 @@ export default function App() {
   const [progress, setProgress] = useState<ProgressState>(null)
   const [modal, setModal] = useState<ModalRequest | null>(null)
   const [cwd, setCwd] = useState('')
+  const [devMode, setDevMode] = useState(false)
+  const [showInspector, setShowInspector] = useState(false)
+  const [protocolEntries, setProtocolEntries] = useState<ProtocolEntry[]>([])
+
   const scriptSourceRef = useRef('')
-  // Track custom formatter names so applyFormatter can route requests.
+  const persistedGeometryRef = useRef<WindowGeometry | null>(null)
   const customFormattersRef = useRef<string[]>([])
+
+  // Window geometry persistence — debounced 500 ms write after resize/move.
+  const geometryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const saveGeometry = useCallback(async () => {
+    try {
+      const win = getCurrentWindow()
+      const { width, height } = await win.outerSize()
+      const { x, y } = await win.outerPosition()
+      await tauriInvoke('save_window_geometry', { width, height, x, y })
+    } catch {
+      // non-fatal
+    }
+  }, [])
+
+  // Attach resize/move listeners after the window is ready.
+  useEffect(() => {
+    const win = getCurrentWindow()
+    let unlisten: (() => void) | null = null
+    const handler = () => {
+      if (geometryTimerRef.current) clearTimeout(geometryTimerRef.current)
+      geometryTimerRef.current = setTimeout(saveGeometry, 500)
+    }
+    const attach = async () => {
+      const off1 = await win.onResized(handler)
+      const off2 = await win.onMoved(handler)
+      unlisten = () => { off1(); off2() }
+    }
+    void attach()
+    return () => {
+      if (unlisten) unlisten()
+      if (geometryTimerRef.current) clearTimeout(geometryTimerRef.current)
+    }
+  }, [saveGeometry])
+
+  const addProtocolEntry = useCallback((direction: 'inbound' | 'outbound', event: unknown) => {
+    setProtocolEntries((prev) => {
+      // Cap at 500 entries to avoid unbounded growth.
+      const next = [...prev, { id: makeProtocolId(), ts: Date.now(), direction, event }]
+      return next.length > 500 ? next.slice(next.length - 500) : next
+    })
+  }, [])
 
   const pushLog = useCallback((entry: Omit<LogEntry, 'id' | 'timestamp'>) => {
     setLogEntries((prev) => [
@@ -66,15 +125,17 @@ export default function App() {
     ])
   }, [])
 
-  // Handle invoke events from the script.
   const handleInvoke = useCallback(
     async (req: InvokeRequest) => {
+      // In dev mode, record outbound invoke requests in the protocol inspector.
+      if (devMode) {
+        addProtocolEntry('outbound', { type: 'invoke', fn: req.fn, callId: req.callId })
+      }
       try {
         switch (req.fn) {
           case 'confirm': {
-            // Show React modal — resolved when user clicks OK/Cancel.
             setModal({ kind: 'confirm', message: req.args.message, callId: req.callId })
-            return // result sent by onConfirm/onCancel handlers
+            return
           }
           case 'prompt': {
             setModal({ kind: 'prompt', message: req.args.message, callId: req.callId })
@@ -126,17 +187,15 @@ export default function App() {
         await sendInvokeResult(anyReq.callId, undefined, String(err))
       }
     },
-    [],
+    [devMode, addProtocolEntry],
   )
 
   const onModalConfirm = useCallback(
     async (callId: string, value?: string) => {
       setModal(null)
       if (value !== undefined) {
-        // prompt
         await sendInvokeResult(callId, { confirmed: true, value })
       } else {
-        // confirm
         await sendInvokeResult(callId, { confirmed: true })
       }
     },
@@ -145,7 +204,6 @@ export default function App() {
 
   const onModalCancel = useCallback(async (callId: string) => {
     setModal(null)
-    // confirm → confirmed:false; prompt → confirmed:false, value:undefined
     await sendInvokeResult(callId, { confirmed: false })
   }, [])
 
@@ -166,7 +224,7 @@ export default function App() {
           return
         case 'manifest':
           setUiTree(event.ui as UiNode)
-          void applyWindowConfig(event.window, scriptSourceRef.current)
+          void applyWindowConfig(event.window, scriptSourceRef.current, persistedGeometryRef.current)
           customFormattersRef.current = event.formatters ?? []
           registerCustomFormatters(event.formatters ?? [])
           return
@@ -181,7 +239,6 @@ export default function App() {
           console.warn('[script:event] unexpected raw state:set:chunk', event)
           return
         case 'state:get': {
-          // Worker requesting state from main thread via GUI bridge.
           const value = stateBridge.get((event as { key: string }).key)
           void tauriInvoke('send_to_child', {
             event: { type: 'state:get:reply', callId: (event as { callId: string }).callId, value },
@@ -189,7 +246,6 @@ export default function App() {
           return
         }
         case 'invoke':
-          // Script is requesting an OS-level primitive.
           void handleInvoke(event as unknown as InvokeRequest)
           return
         case 'format:result':
@@ -210,13 +266,22 @@ export default function App() {
         case 'launch':
           setCwd(msg.cwd)
           scriptSourceRef.current = msg.source
+          persistedGeometryRef.current = msg.persistedGeometry ?? null
+          setDevMode(msg.devMode)
+          if (msg.devMode) setShowInspector(true)
           return
         case 'phase':
           if (msg.phase === 'installing') {
             setView({ kind: 'installing', label: 'Installing dependencies…' })
           } else if (msg.phase === 'running') {
-            setView({ kind: 'running' })
+            setView((prev) => prev.kind === 'env-approval' ? prev : { kind: 'running' })
           }
+          return
+        case 'install-progress':
+          setView({ kind: 'installing', label: msg.label })
+          return
+        case 'env-approval':
+          setView({ kind: 'env-approval', vars: msg.vars, cacheKey: msg.cacheKey })
           return
         case 'script':
           handleScriptEvent(msg.event)
@@ -242,6 +307,7 @@ export default function App() {
                 info: {
                   message: `Script exited with ${msg.code ?? 'null'}${msg.signal ? ` (signal ${msg.signal})` : ''}`,
                   stack: msg.stderrTail || undefined,
+                  logAvailable: msg.logAvailable,
                 },
               }
             })
@@ -249,6 +315,11 @@ export default function App() {
           return
         case 'fatal':
           setView({ kind: 'dead', info: { message: msg.message, stack: msg.stack } })
+          return
+        case 'protocol-event':
+          if (devMode) {
+            addProtocolEntry(msg.direction as 'inbound' | 'outbound', msg.event)
+          }
           return
       }
     })
@@ -262,7 +333,7 @@ export default function App() {
     return () => {
       unlistenPromise.then((off) => off()).catch(() => {})
     }
-  }, [handleScriptEvent, pushLog])
+  }, [handleScriptEvent, pushLog, devMode, addProtocolEntry])
 
   const reload = useCallback(async () => {
     setView({ kind: 'installing', label: 'Reloading…' })
@@ -280,7 +351,6 @@ export default function App() {
     }
   }, [])
 
-  // Cmd/Ctrl+R — kept here so it fires on every screen, not just RunningScreen.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'r') {
@@ -292,22 +362,65 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [reload])
 
-  switch (view.kind) {
-    case 'installing':
-      return <InstallScreen label={view.label} />
-    case 'running':
-      return (
-        <RunningScreen
-          uiTree={uiTree}
-          cwd={cwd}
-          logEntries={logEntries}
-          progress={progress}
-          modal={modal}
-          onModalConfirm={onModalConfirm}
-          onModalCancel={onModalCancel}
-        />
-      )
-    case 'dead':
-      return <DeathScreen info={view.info} onReload={reload} />
+  const renderView = () => {
+    switch (view.kind) {
+      case 'installing':
+        return <InstallScreen label={view.label} />
+      case 'env-approval':
+        return (
+          <EnvApprovalScreen
+            vars={view.vars}
+            cacheKey={view.cacheKey}
+            onApproved={() => setView({ kind: 'installing', label: 'Starting…' })}
+            onDenied={() => setView({ kind: 'dead', info: { message: 'Env-var access denied.' } })}
+          />
+        )
+      case 'running':
+        return (
+          <RunningScreen
+            uiTree={uiTree}
+            cwd={cwd}
+            logEntries={logEntries}
+            progress={progress}
+            modal={modal}
+            onModalConfirm={onModalConfirm}
+            onModalCancel={onModalCancel}
+          />
+        )
+      case 'dead':
+        return <DeathScreen info={view.info} onReload={reload} />
+    }
   }
+
+  return (
+    <>
+      {renderView()}
+      {devMode && showInspector && (
+        <ProtocolInspector
+          entries={protocolEntries}
+          onClose={() => setShowInspector(false)}
+        />
+      )}
+      {devMode && !showInspector && (
+        <button
+          onClick={() => setShowInspector(true)}
+          style={{
+            position: 'fixed',
+            bottom: 8,
+            right: 8,
+            fontSize: 10,
+            padding: '3px 8px',
+            background: '#1a1a1a',
+            border: '1px solid #444',
+            color: '#888',
+            cursor: 'pointer',
+            borderRadius: 3,
+            zIndex: 9998,
+          }}
+        >
+          inspector
+        </button>
+      )}
+    </>
+  )
 }

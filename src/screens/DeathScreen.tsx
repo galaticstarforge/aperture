@@ -1,11 +1,20 @@
-import { AlertOctagon, RefreshCw } from 'lucide-react'
+import { AlertOctagon, RefreshCw, FileText } from 'lucide-react'
+import { invoke as tauriInvoke } from '@tauri-apps/api/core'
 
 export type DeathInfo = {
   message: string
   stack?: string
+  logAvailable?: boolean
 }
 
 export function DeathScreen({ info, onReload }: { info: DeathInfo; onReload: () => void }) {
+  const handleShowLog = async () => {
+    await tauriInvoke('open_log_file').catch((err) => {
+      // eslint-disable-next-line no-console
+      console.warn('[death-screen] open_log_file failed', err)
+    })
+  }
+
   return (
     <div className="ap-screen">
       <div className="ap-death">
@@ -26,6 +35,12 @@ export function DeathScreen({ info, onReload }: { info: DeathInfo; onReload: () 
             <RefreshCw size={14} style={{ verticalAlign: -2, marginRight: 6 }} />
             Reload Script
           </button>
+          {info.logAvailable && (
+            <button onClick={handleShowLog} title="Open stderr log file">
+              <FileText size={14} style={{ verticalAlign: -2, marginRight: 6 }} />
+              Show log
+            </button>
+          )}
         </div>
       </div>
     </div>

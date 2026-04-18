@@ -153,30 +153,46 @@ pub struct SpawnConfig {
     pub cache_key: String,
     /// Absolute path to `~/.aperture/state/` so the shim can persist/load.
     pub state_dir: PathBuf,
-    /// Additional `node_modules` directories appended to `NODE_PATH` so user
-    /// scripts can resolve `zod` without installing it (Phase 6 formalizes
-    /// per-script deps via bun).
+    /// Additional `node_modules` directories appended to `NODE_PATH`.
     pub node_paths: Vec<PathBuf>,
+    /// Approved env vars from `export const env = [...]` (Phase 6).
+    pub approved_env: std::collections::HashMap<String, String>,
+    /// Whether launched in dev mode (verbose tracing, worker analysis).
+    pub dev_mode: bool,
+    /// Path to the per-script stderr log file, if caching is enabled.
+    pub log_path: Option<PathBuf>,
 }
 
 /// Spawn the Aperture script as a child process. Env vars are NOT inherited by
-/// default — a minimal safelist is forwarded.
+/// default — only the OS safelist plus approved script env vars are forwarded.
 pub fn spawn(cfg: SpawnConfig) -> std::io::Result<Spawned> {
-    let env = env_safelist();
     let mut cmd = Command::new(&cfg.node_bin);
     cmd.arg("--import")
         .arg(path_to_file_url(&cfg.loader_module))
         .arg(&cfg.bootstrap_module)
         .arg(&cfg.script_path)
         .env_clear();
-    for (k, v) in env {
+
+    // OS minimum required for Node to start and locate tmp/home.
+    for (k, v) in env_safelist() {
         cmd.env(k, v);
     }
+    // Script-declared approved env vars (Phase 6).
+    for (k, v) in &cfg.approved_env {
+        cmd.env(k, v);
+    }
+
     cmd.env("APERTURE_SCRIPT", &cfg.script_path);
     cmd.env("APERTURE_SOURCE", &cfg.source);
     cmd.env("APERTURE_CLI_FLAGS", &cfg.cli_flags_json);
     cmd.env("APERTURE_CACHE_KEY", &cfg.cache_key);
     cmd.env("APERTURE_STATE_DIR", &cfg.state_dir);
+    if cfg.dev_mode {
+        cmd.env("APERTURE_DEV", "1");
+    }
+    if let Some(ref lp) = cfg.log_path {
+        cmd.env("APERTURE_LOG_PATH", lp);
+    }
     if !cfg.node_paths.is_empty() {
         let sep = if cfg!(windows) { ";" } else { ":" };
         let joined: String = cfg
@@ -225,12 +241,26 @@ pub fn spawn(cfg: SpawnConfig) -> std::io::Result<Spawned> {
         });
     }
 
-    // stderr → rolling tail + per-line events
+    // stderr → rolling tail + per-line events + optional ring-buffer log file
     let stderr_tail = Arc::new(Mutex::new(Vec::<u8>::with_capacity(STDERR_TAIL_CAP)));
     {
         let tx = tx.clone();
         let tail = stderr_tail.clone();
+        let log_path = cfg.log_path.clone();
         tokio::spawn(async move {
+            // Open log file if configured (ring-buffer: single file, 5 MB cap).
+            let mut log_file: Option<tokio::fs::File> = None;
+            if let Some(ref lp) = log_path {
+                if let Ok(f) = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(lp)
+                    .await
+                {
+                    log_file = Some(f);
+                }
+            }
+
             let mut reader = stderr;
             let mut buf = [0u8; 4096];
             let mut line_buf = Vec::<u8>::new();
@@ -247,6 +277,10 @@ pub fn spawn(cfg: SpawnConfig) -> std::io::Result<Spawned> {
                         let drop = t.len() - STDERR_TAIL_CAP;
                         t.drain(..drop);
                     }
+                }
+                // Write to log file (fire-and-forget, errors are non-fatal).
+                if let Some(ref mut f) = log_file {
+                    let _ = tokio::io::AsyncWriteExt::write_all(f, &buf[..n]).await;
                 }
                 for byte in &buf[..n] {
                     if *byte == b'\n' {
@@ -330,9 +364,8 @@ fn signal_of(_status: &std::process::ExitStatus) -> Option<String> {
 }
 
 fn env_safelist() -> HashMap<String, String> {
-    // TODO(phase-6): replace with the full `export const env = [...]` approval
-    // flow. Phase 1 forwards only the basics needed for Node to start and
-    // locate tmp/home on each OS.
+    // Minimum vars for Node.js to start and locate tmp/home on each OS.
+    // Script-declared vars from `export const env = [...]` are added separately.
     let mut out = HashMap::new();
     let keys: &[&str] = &[
         "HOME",

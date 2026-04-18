@@ -19,7 +19,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 
-static VERSION_RE: Lazy<Regex> =
+pub static VERSION_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?m)^\s*//\s*@aperture-version\s+(\d+)\.(\d+)\.(\d+)").unwrap());
 
 /// Read up to the first 4 KB of a file and scan for `// @aperture-version`.

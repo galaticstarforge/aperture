@@ -34,18 +34,23 @@ export type GUIEvent =
   | { type: 'cancel';          reason?: string }
 
 // Internal backend→frontend messages (not ScriptEvents).
+export type WindowGeometry = { width: number; height: number; x: number; y: number }
+
 export type BackendMessage =
-  | { kind: 'launch';      source: string; cwd: string; rawFlags: Record<string, string>; offline: boolean }
-  | { kind: 'phase';       phase: 'installing' | 'running' | 'exiting' }
-  | { kind: 'script';      event: ScriptEvent }
+  | { kind: 'launch';            source: string; cwd: string; rawFlags: Record<string, string>; offline: boolean; devMode: boolean; persistedGeometry?: WindowGeometry | null }
+  | { kind: 'phase';             phase: 'installing' | 'running' | 'exiting' }
+  | { kind: 'script';            event: ScriptEvent }
   // A fully-reassembled state:set. The backend buffers state:set:chunk
   // frames transparently per design.md §"Streaming Opt-In" and only
   // forwards this once `final: true` lands.
-  | { kind: 'state-set';   key: string; value: unknown }
-  | { kind: 'stderr';      line: string }
-  | { kind: 'parse-error'; line: string; error: string }
-  | { kind: 'child-exit';  code: number | null; signal: string | null; stderrTail: string }
-  | { kind: 'fatal';       message: string; stack?: string }
+  | { kind: 'state-set';         key: string; value: unknown }
+  | { kind: 'stderr';            line: string }
+  | { kind: 'parse-error';       line: string; error: string }
+  | { kind: 'child-exit';        code: number | null; signal: string | null; stderrTail: string; logAvailable: boolean }
+  | { kind: 'fatal';             message: string; stack?: string }
+  | { kind: 'env-approval';      vars: string[]; cacheKey: string }
+  | { kind: 'install-progress';  label: string }
+  | { kind: 'protocol-event';    direction: 'inbound' | 'outbound'; event: unknown }
 
 // Invoke confirm/prompt modal request shapes.
 export type InvokeRequest =
