@@ -12,7 +12,9 @@
 //! (Phase 3), `invoke` suite (Phase 4), workers (Phase 5), CLI subcommands
 //! and dep installer (Phase 6).
 
+pub mod cache_key;
 pub mod child;
+pub mod chunks;
 pub mod cli;
 pub mod events;
 pub mod fs_layout;
@@ -24,12 +26,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use serde_json::json;
+use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 
 use crate::child::{ChildHandle, HostEvent, SpawnConfig, Spawned};
-use crate::cli::{ParsedArgs, ScriptSource};
+use crate::chunks::{ChunkBuffers, ChunkOutcome};
+use crate::cli::ParsedArgs;
 use crate::events::{BackendMessage, Phase};
 use crate::fs_layout::Layout;
 
@@ -51,6 +54,10 @@ pub struct AppState {
 pub struct BundledAssets {
     pub loader_module: PathBuf,
     pub bootstrap_module: PathBuf,
+    /// `node_modules` directories appended to `NODE_PATH` so the child can
+    /// resolve `zod` (and, pre-Phase 6, any other shared packages) without
+    /// installing them in the user's working dir.
+    pub node_paths: Vec<PathBuf>,
 }
 
 impl BundledAssets {
@@ -75,9 +82,31 @@ impl BundledAssets {
             if loader.is_file() && bootstrap.is_file() {
                 // Canonicalize so `url::Url::from_file_path` accepts them on
                 // every platform (it rejects relative paths).
+                let loader = std::fs::canonicalize(&loader).unwrap_or(loader);
+                let bootstrap = std::fs::canonicalize(&bootstrap).unwrap_or(bootstrap);
+                // node_modules typically sits alongside runtime-shim/ at
+                // the repo root. Include both that and the Cargo manifest's
+                // parent node_modules as fall-backs.
+                let mut node_paths = Vec::new();
+                if let Some(parent) = bootstrap.parent().and_then(|p| p.parent()) {
+                    let nm = parent.join("node_modules");
+                    if nm.is_dir() {
+                        node_paths.push(nm);
+                    }
+                }
+                let manifest_nm =
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../node_modules");
+                if manifest_nm.is_dir() {
+                    if let Ok(c) = std::fs::canonicalize(&manifest_nm) {
+                        if !node_paths.iter().any(|p| p == &c) {
+                            node_paths.push(c);
+                        }
+                    }
+                }
                 return Ok(Self {
-                    loader_module: std::fs::canonicalize(&loader).unwrap_or(loader),
-                    bootstrap_module: std::fs::canonicalize(&bootstrap).unwrap_or(bootstrap),
+                    loader_module: loader,
+                    bootstrap_module: bootstrap,
+                    node_paths,
                 });
             }
         }
@@ -161,7 +190,11 @@ pub fn run() -> anyhow::Result<()> {
     // portable, per-script baseline called for in the phase doc.
     tauri::Builder::default()
         .manage(state.clone())
-        .invoke_handler(tauri::generate_handler![frontend_ready, reload_script])
+        .invoke_handler(tauri::generate_handler![
+            frontend_ready,
+            reload_script,
+            send_to_child
+        ])
         .setup(move |app| {
             let handle = app.handle().clone();
             let state = state.clone();
@@ -219,6 +252,25 @@ async fn reload_script(app: AppHandle, state: tauri::State<'_, Arc<AppState>>) -
     Ok(())
 }
 
+/// Forward a single GUIEvent JSON value into the running child's stdin as
+/// one NDJSON line. The frontend uses this to deliver `state:set`,
+/// `state:changed`, `cancel`, and (in Phase 4+) `invoke:result` events.
+#[tauri::command]
+async fn send_to_child(
+    state: tauri::State<'_, Arc<AppState>>,
+    event: serde_json::Value,
+) -> Result<(), String> {
+    let handle_opt = {
+        let guard = state.child.lock();
+        guard.as_ref().map(|h| h.clone_for_stdin())
+    };
+    let Some(handle) = handle_opt else {
+        return Err("no running child".into());
+    };
+    let line = serde_json::to_string(&event).map_err(|e| e.to_string())?;
+    handle.send_line(&line).await.map_err(|e| e.to_string())
+}
+
 async fn lifecycle_entry(app: AppHandle, state: Arc<AppState>) {
     let session = state.session.fetch_add(1, Ordering::SeqCst) + 1;
     emit(&app, &BackendMessage::Phase { phase: Phase::Installing });
@@ -244,11 +296,13 @@ async fn lifecycle_entry(app: AppHandle, state: Arc<AppState>) {
         }
     };
 
-    let params_json = serde_json::to_string(&json!({
-        "offline": state.args.offline,
-        "flags": state.args.raw_flags,
-    }))
-    .unwrap_or_else(|_| "{}".to_string());
+    let cli_flags_json =
+        serde_json::to_string(&state.args.raw_flags).unwrap_or_else(|_| "{}".to_string());
+
+    let cache_key = cache_key::derive(&script_path)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
 
     let node_bin = match resolve_node() {
         Ok(p) => p,
@@ -272,7 +326,11 @@ async fn lifecycle_entry(app: AppHandle, state: Arc<AppState>) {
         bootstrap_module: state.bundled.bootstrap_module.clone(),
         script_path,
         cwd: state.args.cwd.clone(),
-        params_json,
+        cli_flags_json,
+        source: state.args.source.as_display(),
+        cache_key,
+        state_dir: state.layout.state.clone(),
+        node_paths: state.bundled.node_paths.clone(),
     };
 
     let Spawned { handle, events } = match child::spawn(cfg) {
@@ -306,6 +364,7 @@ async fn drive(
     session: u64,
     mut events: mpsc::UnboundedReceiver<HostEvent>,
 ) {
+    let mut chunks = ChunkBuffers::new();
     while let Some(ev) = events.recv().await {
         if state.session.load(Ordering::SeqCst) != session {
             // Superseded by a reload. Keep draining the channel so the old
@@ -315,7 +374,7 @@ async fn drive(
         }
         match ev {
             HostEvent::Stdout(value) => {
-                emit(&app, &BackendMessage::Script { event: value });
+                route_script_event(&app, &mut chunks, value);
             }
             HostEvent::ParseError { line, error } => {
                 emit(&app, &BackendMessage::ParseError { line, error });
@@ -334,6 +393,47 @@ async fn drive(
                 );
                 break;
             }
+        }
+    }
+}
+
+/// Reassemble `state:set:chunk` frames into a single `state:set` for the
+/// frontend, forward every other script event verbatim.
+fn route_script_event(app: &AppHandle, chunks: &mut ChunkBuffers, value: Value) {
+    let ty = value.get("type").and_then(Value::as_str).unwrap_or("");
+    match ty {
+        "state:set:chunk" => match chunks.feed_chunk(&value) {
+            ChunkOutcome::Buffering => {}
+            ChunkOutcome::Assembled { key, value } => {
+                emit(app, &BackendMessage::StateSet { key, value });
+            }
+            ChunkOutcome::Failed { key, error } => {
+                emit(
+                    app,
+                    &BackendMessage::ParseError {
+                        line: format!("<chunk buffer for key={key}>"),
+                        error,
+                    },
+                );
+            }
+        },
+        "state:set" => {
+            if let Some(key) = value.get("key").and_then(Value::as_str) {
+                chunks.drop_pending(key);
+                let v = value.get("value").cloned().unwrap_or(Value::Null);
+                emit(
+                    app,
+                    &BackendMessage::StateSet {
+                        key: key.to_string(),
+                        value: v,
+                    },
+                );
+                return;
+            }
+            emit(app, &BackendMessage::Script { event: value });
+        }
+        _ => {
+            emit(app, &BackendMessage::Script { event: value });
         }
     }
 }

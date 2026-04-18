@@ -1,19 +1,31 @@
 // `aperture:runtime` — virtual module shim.
 //
-// Phase 1 surface: `progress` and `log` are real and emit valid NDJSON.
-// Everything else is a typed stub that throws a clear "not implemented until
-// Phase N" error when called — the design.md contract is visible to scripts
-// so `import` statements don't fail, but calling a stubbed API surfaces the
-// scope boundary loudly.
+// Phase 2 surface:
+//   - `progress`, `log`        — real (NDJSON over stdout)
+//   - `state`                  — real reactive store (set/get/setIn/push/
+//                                watch/persist); backed by a StateStore
+//                                instance installed by the bootstrap
+//   - `params`                 — frozen launch-time snapshot set by bootstrap
+//   - `signal`                 — AbortSignal wired to cancel/exit
+//   - `invoke`, `invokeStream`, `on`, `createWorker` — stubs that throw,
+//     landing in Phases 4/5.
+//
+// The shim installs zod `.persist()` / `.stream()` prototype extensions at
+// load-time so user schemas written as `z.string().persist()` work without
+// any extra import.
+
+import './schema-markers.mjs'
+import { install as installSchemaMarkers } from './schema-markers.mjs'
+
+installSchemaMarkers()
 
 function emit(event) {
-  // Writes one NDJSON line to stdout. The Tauri backend owns the pipe and
-  // parses these per design.md §"Communication Architecture".
+  // Writes one NDJSON line to stdout. The Tauri backend owns the pipe.
   const line = JSON.stringify(event)
   process.stdout.write(line + '\n')
 }
 
-// --- real in Phase 1 ---------------------------------------------------------
+// --- progress / log ----------------------------------------------------------
 
 export function progress(value, label) {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
@@ -25,12 +37,77 @@ export function progress(value, label) {
 }
 
 export function log(message, level = 'info', data) {
-  if (!['info', 'warn', 'error'].includes(level)) {
-    throw new TypeError(`log(message, level?, data?) — level must be info|warn|error (got ${level})`)
+  if (!['info', 'warn', 'error', 'debug'].includes(level)) {
+    throw new TypeError(
+      `log(message, level?, data?) — level must be info|warn|error|debug (got ${level})`,
+    )
   }
-  const evt = { type: 'log', level, message: String(message) }
+  // `debug` is folded into `info` on the wire until the log panel learns
+  // richer levels (Phase 3/4).
+  const wireLevel = level === 'debug' ? 'info' : level
+  const evt = { type: 'log', level: wireLevel, message: String(message) }
   if (data !== undefined) evt.data = data
   emit(evt)
+}
+
+// --- state -------------------------------------------------------------------
+
+let store = null
+
+/**
+ * Installed once by the bootstrap after schema extraction + params validation.
+ * The object returned by `state` delegates to this live store; calling state
+ * methods before installation throws with a clear phase error.
+ */
+export function __installStore(s) {
+  store = s
+}
+
+function requireStore(method) {
+  if (!store) {
+    throw new Error(
+      `aperture:runtime.state.${method} called before the store was initialized. ` +
+        `This usually means the script body (not just onLoad) touched state — ` +
+        `move the call into onLoad or a later callback.`,
+    )
+  }
+  return store
+}
+
+export const state = Object.freeze({
+  set(key, value) {
+    return requireStore('set').set(key, value, 'script')
+  },
+  get(key) {
+    return requireStore('get').get(key)
+  },
+  setIn(path, value) {
+    return requireStore('setIn').setIn(path, value)
+  },
+  push(key, item) {
+    return requireStore('push').push(key, item)
+  },
+  watch(key, handler) {
+    return requireStore('watch').watch(key, handler)
+  },
+  persist() {
+    return requireStore('persist').persist()
+  },
+})
+
+// --- params ------------------------------------------------------------------
+
+export let params = Object.freeze({})
+export function __setParams(p) {
+  params = Object.freeze({ ...(p ?? {}) })
+}
+
+// --- signal / cancellation ---------------------------------------------------
+
+const controller = new AbortController()
+export const signal = controller.signal
+export function __abort(reason) {
+  controller.abort(reason)
 }
 
 // --- stubbed: real behavior arrives in later phases --------------------------
@@ -43,46 +120,7 @@ function notYet(name, phase) {
   }
 }
 
-function stubObject(name, phase, keys) {
-  const handler = {
-    get(_t, prop) {
-      if (prop === Symbol.toPrimitive || prop === 'toString') {
-        return () => `[aperture:runtime.${name} — stub, Phase ${phase}]`
-      }
-      if (typeof prop === 'symbol') return undefined
-      if (!keys.includes(prop)) return undefined
-      return notYet(`${name}.${prop}`, phase)
-    },
-  }
-  return new Proxy({}, handler)
-}
-
-export const state = stubObject('state', 2, [
-  'set',
-  'get',
-  'setIn',
-  'push',
-  'watch',
-  'persist',
-])
-
 export const invoke = notYet('invoke', 4)
 export const invokeStream = notYet('invokeStream', 4)
 export const on = notYet('on', 4)
 export const createWorker = notYet('createWorker', 5)
-
-// `params` is filled in by the bootstrap before the user script runs. It is a
-// frozen object (or `{}` if no params were passed).
-export let params = Object.freeze({})
-export function __setParams(p) {
-  params = Object.freeze({ ...(p ?? {}) })
-}
-
-// `signal` — Phase 1 exposes an AbortController so scripts that simply read
-// `signal.aborted` work. The signal *never fires* in Phase 1; cancellation /
-// timeout wiring lands in Phase 4.
-const controller = new AbortController()
-export const signal = controller.signal
-export function __abort(reason) {
-  controller.abort(reason)
-}

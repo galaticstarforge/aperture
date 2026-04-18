@@ -25,6 +25,10 @@ export type BackendMessage =
   | { kind: 'launch';      source: string; cwd: string; rawFlags: Record<string, string>; offline: boolean }
   | { kind: 'phase';       phase: 'installing' | 'running' | 'exiting' }
   | { kind: 'script';      event: ScriptEvent }
+  // A fully-reassembled state:set. The backend buffers state:set:chunk
+  // frames transparently per design.md §"Streaming Opt-In" and only
+  // forwards this once `final: true` lands.
+  | { kind: 'state-set';   key: string; value: unknown }
   | { kind: 'stderr';      line: string }
   | { kind: 'parse-error'; line: string; error: string }
   | { kind: 'child-exit';  code: number | null; signal: string | null; stderrTail: string }

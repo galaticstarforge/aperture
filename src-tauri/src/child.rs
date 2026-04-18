@@ -17,7 +17,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::time::{timeout, Duration};
 
 use crate::ndjson::{LineFramer, ParseOutcome};
@@ -46,15 +46,45 @@ pub enum HostEvent {
 }
 
 pub struct ChildHandle {
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    /// `tokio::sync::Mutex` (not parking_lot) because we hold the guard
+    /// across `.await` when writing to stdin — a `parking_lot::MutexGuard`
+    /// is !Send and makes `#[tauri::command]` futures fail the Send bound.
+    stdin: Arc<AsyncMutex<Option<ChildStdin>>>,
     child: Arc<Mutex<Option<Child>>>,
 }
 
+/// Lightweight clone that shares the same stdin slot — used by Tauri
+/// commands (e.g. `send_to_child`) that want to forward a line without
+/// holding the main `AppState.child` mutex across `.await`.
+pub struct ChildStdinRef {
+    stdin: Arc<AsyncMutex<Option<ChildStdin>>>,
+}
+
+impl ChildStdinRef {
+    pub async fn send_line(&self, line: &str) -> std::io::Result<()> {
+        let mut guard = self.stdin.lock().await;
+        if let Some(stdin) = guard.as_mut() {
+            stdin.write_all(line.as_bytes()).await?;
+            if !line.ends_with('\n') {
+                stdin.write_all(b"\n").await?;
+            }
+            stdin.flush().await?;
+        }
+        Ok(())
+    }
+}
+
 impl ChildHandle {
+    pub fn clone_for_stdin(&self) -> ChildStdinRef {
+        ChildStdinRef {
+            stdin: self.stdin.clone(),
+        }
+    }
+
     /// Write a line of JSON to the child's stdin. Silently drops if stdin is
     /// already closed (script exited).
     pub async fn send_line(&self, line: &str) -> std::io::Result<()> {
-        let mut guard = self.stdin.lock();
+        let mut guard = self.stdin.lock().await;
         if let Some(stdin) = guard.as_mut() {
             stdin.write_all(line.as_bytes()).await?;
             if !line.ends_with('\n') {
@@ -71,7 +101,7 @@ impl ChildHandle {
         // Close stdin so the child sees EOF even if it isn't listening for
         // cancel yet (Phase 4 wires the real handler).
         {
-            let mut guard = self.stdin.lock();
+            let mut guard = self.stdin.lock().await;
             *guard = None;
         }
         let waiter = {
@@ -112,7 +142,21 @@ pub struct SpawnConfig {
     pub bootstrap_module: PathBuf,
     pub script_path: PathBuf,
     pub cwd: PathBuf,
-    pub params_json: String,
+    /// Raw CLI flag pairs (`--key value`), passed through untouched for the
+    /// shim to merge with URL query params and validate against `schema`.
+    pub cli_flags_json: String,
+    /// The original source argument — local path or `http(s)://…` URL — used
+    /// by the shim to extract URL query params for merging.
+    pub source: String,
+    /// Phase-2 cache key, or empty string when the script declined caching
+    /// (no `// @aperture-version` comment). See cache_key.rs.
+    pub cache_key: String,
+    /// Absolute path to `~/.aperture/state/` so the shim can persist/load.
+    pub state_dir: PathBuf,
+    /// Additional `node_modules` directories appended to `NODE_PATH` so user
+    /// scripts can resolve `zod` without installing it (Phase 6 formalizes
+    /// per-script deps via bun).
+    pub node_paths: Vec<PathBuf>,
 }
 
 /// Spawn the Aperture script as a child process. Env vars are NOT inherited by
@@ -129,7 +173,20 @@ pub fn spawn(cfg: SpawnConfig) -> std::io::Result<Spawned> {
         cmd.env(k, v);
     }
     cmd.env("APERTURE_SCRIPT", &cfg.script_path);
-    cmd.env("APERTURE_PARAMS", &cfg.params_json);
+    cmd.env("APERTURE_SOURCE", &cfg.source);
+    cmd.env("APERTURE_CLI_FLAGS", &cfg.cli_flags_json);
+    cmd.env("APERTURE_CACHE_KEY", &cfg.cache_key);
+    cmd.env("APERTURE_STATE_DIR", &cfg.state_dir);
+    if !cfg.node_paths.is_empty() {
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let joined: String = cfg
+            .node_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(sep);
+        cmd.env("NODE_PATH", joined);
+    }
     cmd.current_dir(&cfg.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -143,7 +200,7 @@ pub fn spawn(cfg: SpawnConfig) -> std::io::Result<Spawned> {
 
     let (tx, rx) = mpsc::unbounded_channel();
     let child = Arc::new(Mutex::new(Some(child)));
-    let stdin = Arc::new(Mutex::new(Some(stdin)));
+    let stdin = Arc::new(AsyncMutex::new(Some(stdin)));
 
     // stdout → NDJSON framer → HostEvent::Stdout / ParseError
     {

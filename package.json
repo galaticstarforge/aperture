@@ -3,19 +3,20 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Aperture — a GUI-native .mjs script runner (Phase 1 skeleton)",
+  "description": "Aperture — a GUI-native .mjs script runner (Phase 2: state, schema, reactivity)",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test:shim": "node --test runtime-shim/__tests__/*.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
-    "@tauri-apps/plugin-single-instance": "^2.0.0",
     "lucide-react": "^0.400.0",
     "react": "^18.3.0",
-    "react-dom": "^18.3.0"
+    "react-dom": "^18.3.0",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",
