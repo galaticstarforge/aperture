@@ -5,7 +5,6 @@ import { invoke as tauriInvoke } from '@tauri-apps/api/core'
 
 export function EnvApprovalScreen({
   vars,
-  cacheKey,
   onApproved,
   onDenied,
 }: {
