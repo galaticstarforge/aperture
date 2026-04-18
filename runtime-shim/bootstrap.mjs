@@ -126,6 +126,58 @@ const store = new StateStore({
 
 runtime.__installStore(store)
 
+// --- emit manifest event (Phase 3) ------------------------------------------
+
+const currentStateSnapshot = () => Object.fromEntries(store.values)
+
+const isUiFn = typeof manifest.ui === 'function'
+const initialUiTree = isUiFn
+  ? (() => {
+      try {
+        return manifest.ui(currentStateSnapshot(), paramsResult.data)
+      } catch {
+        return {}
+      }
+    })()
+  : manifest.ui
+
+emit({
+  type: 'manifest',
+  ui: initialUiTree,
+  window: manifest.window,
+  callbacks: Object.keys(manifest.callbacks),
+})
+
+// For function-form ui, re-emit the tree on any state change via a debounced
+// microtask so rapid multi-key writes collapse into one emission.
+if (isUiFn) {
+  let uiUpdatePending = false
+  const scheduleUiUpdate = () => {
+    if (uiUpdatePending) return
+    uiUpdatePending = true
+    queueMicrotask(() => {
+      uiUpdatePending = false
+      try {
+        emit({ type: 'ui:update', tree: manifest.ui(currentStateSnapshot(), paramsResult.data) })
+      } catch {
+        // Swallow - a bad ui function shouldn't crash the process.
+      }
+    })
+  }
+  // Watch every declared state key.
+  if (manifest.state) {
+    const shape =
+      typeof manifest.state._def?.shape === 'function'
+        ? manifest.state._def.shape()
+        : typeof manifest.state.shape === 'function'
+          ? manifest.state.shape()
+          : manifest.state._def?.shape ?? {}
+    for (const key of Object.keys(shape ?? {})) {
+      store.watch(key, scheduleUiUpdate)
+    }
+  }
+}
+
 // --- stdin wiring for GUI → script writes ------------------------------------
 
 let exiting = false
@@ -181,9 +233,19 @@ rl.on('line', (line) => {
         store.set(msg.key, msg.value, 'gui')
       }
       return
+    case 'call': {
+      // Dispatch a named callback. Phase 4 adds returnsInto / invoke handling.
+      const fn = typeof msg.fn === 'string' ? manifest.callbacks[msg.fn] : null
+      if (!fn) return
+      void Promise.resolve()
+        .then(() => fn(msg.args ?? {}, runtime))
+        .catch((err) => {
+          emitError(err?.message ?? String(err), err?.stack)
+        })
+      return
+    }
     default:
-      // Other GUIEvent variants (call, invoke:result, …) are picked up in
-      // Phases 4+.
+      // Other GUIEvent variants (invoke:result, …) are picked up in Phases 4+.
       return
   }
 })

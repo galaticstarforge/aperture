@@ -1,6 +1,15 @@
 // Wire-protocol types mirrored between Rust backend and React frontend.
 // Full union is declared here so later phases plug in by adding a case.
 
+export type WindowConfig = {
+  width?: number
+  height?: number
+  resizable?: boolean
+  minWidth?: number
+  minHeight?: number
+  title?: string
+}
+
 export type ScriptEvent =
   | { type: 'progress';        value: number; label?: string }
   | { type: 'log';             level: 'info' | 'warn' | 'error'; message: string; data?: unknown; source?: string }
@@ -10,6 +19,8 @@ export type ScriptEvent =
   | { type: 'invoke';          fn: string; args: unknown; callId: string; stream?: boolean }
   | { type: 'result';          data: unknown }
   | { type: 'error';           message: string; stack?: string }
+  | { type: 'manifest';        ui: unknown; window: WindowConfig; callbacks: string[] }
+  | { type: 'ui:update';       tree: unknown }
 
 export type GUIEvent =
   | { type: 'state:set';       key: string; value: unknown }

@@ -1,54 +1,97 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { listen } from '@tauri-apps/api/event'
 import { invoke as tauriInvoke } from '@tauri-apps/api/core'
-import type { BackendMessage, ScriptEvent } from './types'
+import { getCurrentWindow } from '@tauri-apps/api/window'
+import type { BackendMessage, ScriptEvent, WindowConfig } from './types'
 import { InstallScreen } from './screens/InstallScreen'
 import { RunningScreen } from './screens/RunningScreen'
 import { DeathScreen, type DeathInfo } from './screens/DeathScreen'
 import { stateBridge, installDevHandle } from './state-bridge'
+import { type LogEntry, makeLogId } from './ui/LogPanel'
+import type { UiNode } from './ui/types'
 
 type View =
   | { kind: 'installing'; label: string }
   | { kind: 'running' }
   | { kind: 'dead'; info: DeathInfo }
 
+async function applyWindowConfig(cfg: WindowConfig, scriptSource: string) {
+  const win = getCurrentWindow()
+  const title = cfg.title ?? scriptSource.split('/').pop()?.replace(/\.mjs$/, '') ?? 'Aperture'
+  try {
+    await win.setTitle(title)
+    if (cfg.width && cfg.height) {
+      const { LogicalSize } = await import('@tauri-apps/api/dpi')
+      await win.setSize(new LogicalSize(cfg.width, cfg.height))
+    }
+    if (cfg.resizable !== undefined) await win.setResizable(cfg.resizable)
+    if (cfg.minWidth && cfg.minHeight) {
+      const { LogicalSize } = await import('@tauri-apps/api/dpi')
+      await win.setMinSize(new LogicalSize(cfg.minWidth, cfg.minHeight))
+    }
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[window-config]', err)
+  }
+}
+
 export default function App() {
   const [view, setView] = useState<View>({ kind: 'installing', label: 'Installing dependencies…' })
+  const [uiTree, setUiTree] = useState<UiNode | null>(null)
+  const [logEntries, setLogEntries] = useState<LogEntry[]>([])
+  const [cwd, setCwd] = useState('')
+  const scriptSourceRef = useRef('')
 
-  const handleScriptEvent = useCallback((event: ScriptEvent) => {
-    switch (event.type) {
-      case 'error':
-        setView({ kind: 'dead', info: { message: event.message, stack: event.stack } })
-        return
-      case 'result':
-        // First result dismisses the scrim; Phase 3 will render real UI here.
-        return
-      case 'log':
-        // Phase 3 introduces a real log panel; for now bubble to devtools.
-        // eslint-disable-next-line no-console
-        console.log(`[script:${event.level}]`, event.message, event.data ?? '')
-        return
-      case 'state:set':
-        stateBridge.ingestScriptSet(event.key, event.value)
-        return
-      case 'state:set:chunk':
-        // Backend transparently reassembles chunks into `state-set` backend
-        // messages, so this branch shouldn't normally fire. If it does, the
-        // chunk arrived out-of-band (e.g. dev-mode bypass) — warn and drop.
-        // eslint-disable-next-line no-console
-        console.warn('[script:event] unexpected raw state:set:chunk', event)
-        return
-      default:
-        // Every other ScriptEvent is logged and ignored until its phase lands.
-        // eslint-disable-next-line no-console
-        console.debug('[script:event]', event)
-    }
+  const pushLog = useCallback((entry: Omit<LogEntry, 'id' | 'timestamp'>) => {
+    setLogEntries((prev) => [
+      ...prev,
+      { ...entry, id: makeLogId(), timestamp: Date.now() },
+    ])
   }, [])
+
+  const handleScriptEvent = useCallback(
+    (event: ScriptEvent) => {
+      switch (event.type) {
+        case 'error':
+          setView({ kind: 'dead', info: { message: event.message, stack: event.stack } })
+          return
+        case 'result':
+          // onLoad completed — dismiss install scrim if still visible.
+          setView((prev) => (prev.kind === 'installing' ? { kind: 'running' } : prev))
+          return
+        case 'log':
+          pushLog({ level: event.level, message: event.message, data: event.data })
+          return
+        case 'manifest':
+          setUiTree(event.ui as UiNode)
+          void applyWindowConfig(event.window, scriptSourceRef.current)
+          return
+        case 'ui:update':
+          setUiTree(event.tree as UiNode)
+          return
+        case 'state:set':
+          stateBridge.ingestScriptSet(event.key, event.value)
+          return
+        case 'state:set:chunk':
+          // eslint-disable-next-line no-console
+          console.warn('[script:event] unexpected raw state:set:chunk', event)
+          return
+        default:
+          // eslint-disable-next-line no-console
+          console.debug('[script:event]', event)
+      }
+    },
+    [pushLog],
+  )
 
   useEffect(() => {
     const unlistenPromise = listen<BackendMessage>('aperture://message', (evt) => {
       const msg = evt.payload
       switch (msg.kind) {
+        case 'launch':
+          setCwd(msg.cwd)
+          scriptSourceRef.current = msg.source
+          return
         case 'phase':
           if (msg.phase === 'installing') {
             setView({ kind: 'installing', label: 'Installing dependencies…' })
@@ -61,13 +104,11 @@ export default function App() {
           return
         case 'state-set':
           stateBridge.ingestScriptSet(msg.key, msg.value)
-          // Mirror to devtools so Phase 2 acceptance can be eyeballed.
           // eslint-disable-next-line no-console
           console.debug('[state:set]', msg.key, msg.value)
           return
         case 'stderr':
-          // eslint-disable-next-line no-console
-          console.log('[stderr]', msg.line)
+          pushLog({ level: 'stderr', message: msg.line })
           return
         case 'parse-error':
           // eslint-disable-next-line no-console
@@ -76,9 +117,6 @@ export default function App() {
         case 'child-exit':
           if (msg.code !== 0 || msg.signal) {
             setView((prev) => {
-              // A structured `error` event already set up the death screen
-              // with the real message/stack — don't clobber it with the less
-              // informative exit code summary.
               if (prev.kind === 'dead') return prev
               return {
                 kind: 'dead',
@@ -93,11 +131,6 @@ export default function App() {
         case 'fatal':
           setView({ kind: 'dead', info: { message: msg.message, stack: msg.stack } })
           return
-        case 'launch':
-          // Informational for now.
-          // eslint-disable-next-line no-console
-          console.debug('[launch]', msg)
-          return
       }
     })
 
@@ -110,10 +143,12 @@ export default function App() {
     return () => {
       unlistenPromise.then((off) => off()).catch(() => {})
     }
-  }, [handleScriptEvent])
+  }, [handleScriptEvent, pushLog])
 
   const reload = useCallback(async () => {
     setView({ kind: 'installing', label: 'Reloading…' })
+    setUiTree(null)
+    setLogEntries([])
     try {
       await tauriInvoke('reload_script')
     } catch (err) {
@@ -124,6 +159,7 @@ export default function App() {
     }
   }, [])
 
+  // Cmd/Ctrl+R — kept here so it fires on every screen, not just RunningScreen.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'r') {
@@ -139,7 +175,7 @@ export default function App() {
     case 'installing':
       return <InstallScreen label={view.label} />
     case 'running':
-      return <RunningScreen />
+      return <RunningScreen uiTree={uiTree} cwd={cwd} logEntries={logEntries} />
     case 'dead':
       return <DeathScreen info={view.info} onReload={reload} />
   }
