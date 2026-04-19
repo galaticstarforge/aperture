@@ -130,7 +130,11 @@ pub fn run() -> anyhow::Result<()> {
                     std::process::exit(2);
                 }
             };
-            let _ = subcommands::cmd_validate(script.clone(), *headless_lint, &bundled);
+            if let Err(e) = subcommands::cmd_validate(script.clone(), *headless_lint, &bundled) {
+                eprintln!("aperture: {e}");
+                std::process::exit(1);
+            }
+            return Ok(());
         }
         ApertureCommand::HeadlessRun(args) => {
             let bundled = match BundledPaths::resolve() {
@@ -144,6 +148,7 @@ pub fn run() -> anyhow::Result<()> {
                 eprintln!("aperture: {e}");
                 std::process::exit(1);
             }
+            return Ok(());
         }
         ApertureCommand::GuiLaunch(_) | ApertureCommand::DevLaunch(_) => {}
     }

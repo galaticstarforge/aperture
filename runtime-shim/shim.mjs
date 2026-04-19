@@ -171,14 +171,19 @@ export function invoke(fn, args = {}) {
       return
     }
     const callId = nextCallId()
-    _pendingInvokes.set(callId, { resolve, reject })
-
     const onAbort = () => {
       if (_pendingInvokes.has(callId)) {
         _pendingInvokes.delete(callId)
         reject(new DOMException(String(signal.reason ?? 'Aborted'), 'AbortError'))
       }
     }
+    // Wrap resolve/reject so the abort listener is removed on normal settlement.
+    // Without this, each invoke leaks a listener closure until abort fires.
+    const cleanup = () => signal.removeEventListener('abort', onAbort)
+    _pendingInvokes.set(callId, {
+      resolve: (v) => { cleanup(); resolve(v) },
+      reject: (e) => { cleanup(); reject(e) },
+    })
     signal.addEventListener('abort', onAbort, { once: true })
 
     emit({ type: 'invoke', fn, args, callId })

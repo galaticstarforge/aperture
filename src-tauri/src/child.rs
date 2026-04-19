@@ -27,6 +27,11 @@ use crate::ndjson::{LineFramer, ParseOutcome};
 /// event.
 const STDERR_TAIL_CAP: usize = 8 * 1024;
 
+/// Upper bound for the per-script stderr log file. When the file exceeds this
+/// at open time, or grows past it during a session, it's truncated to keep
+/// only the most-recent tail. Prevents unbounded growth across sessions.
+const LOG_FILE_CAP: u64 = 5 * 1024 * 1024;
+
 /// Messages the host emits to the rest of the app.
 #[derive(Debug)]
 pub enum HostEvent {
@@ -248,9 +253,14 @@ pub fn spawn(cfg: SpawnConfig) -> std::io::Result<Spawned> {
         let tail = stderr_tail.clone();
         let log_path = cfg.log_path.clone();
         tokio::spawn(async move {
-            // Open log file if configured (ring-buffer: single file, 5 MB cap).
+            // Open log file if configured. Enforce LOG_FILE_CAP at open time by
+            // truncating pre-existing content from the front. During the session
+            // we rotate when the running total exceeds the cap.
             let mut log_file: Option<tokio::fs::File> = None;
+            let mut log_bytes_written: u64 = 0;
             if let Some(ref lp) = log_path {
+                rotate_if_oversized(lp).await;
+                log_bytes_written = tokio::fs::metadata(lp).await.map(|m| m.len()).unwrap_or(0);
                 if let Ok(f) = tokio::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -281,6 +291,24 @@ pub fn spawn(cfg: SpawnConfig) -> std::io::Result<Spawned> {
                 // Write to log file (fire-and-forget, errors are non-fatal).
                 if let Some(ref mut f) = log_file {
                     let _ = tokio::io::AsyncWriteExt::write_all(f, &buf[..n]).await;
+                    log_bytes_written = log_bytes_written.saturating_add(n as u64);
+                    if log_bytes_written > LOG_FILE_CAP {
+                        // Close current handle, rotate, reopen at new (smaller) tail.
+                        drop(log_file.take());
+                        if let Some(ref lp) = log_path {
+                            rotate_if_oversized(lp).await;
+                            log_bytes_written =
+                                tokio::fs::metadata(lp).await.map(|m| m.len()).unwrap_or(0);
+                            if let Ok(f) = tokio::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(lp)
+                                .await
+                            {
+                                log_file = Some(f);
+                            }
+                        }
+                    }
                 }
                 for byte in &buf[..n] {
                     if *byte == b'\n' {
@@ -339,6 +367,33 @@ pub fn spawn(cfg: SpawnConfig) -> std::io::Result<Spawned> {
         handle: ChildHandle { stdin, child },
         events: rx,
     })
+}
+
+/// If `path` exists and exceeds `LOG_FILE_CAP`, rewrite it so it contains only
+/// the last `LOG_FILE_CAP / 2` bytes. Errors are non-fatal — logging is
+/// best-effort and must not crash the script.
+async fn rotate_if_oversized(path: &Path) {
+    let size = match tokio::fs::metadata(path).await {
+        Ok(m) => m.len(),
+        Err(_) => return,
+    };
+    if size <= LOG_FILE_CAP {
+        return;
+    }
+    let keep = (LOG_FILE_CAP / 2) as usize;
+    // Read the whole file (bounded; the cap makes this fine), keep the tail.
+    let data = match tokio::fs::read(path).await {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let start = data.len().saturating_sub(keep);
+    // Align to the next newline so we don't start mid-line.
+    let aligned = data[start..]
+        .iter()
+        .position(|b| *b == b'\n')
+        .map(|i| start + i + 1)
+        .unwrap_or(start);
+    let _ = tokio::fs::write(path, &data[aligned..]).await;
 }
 
 fn dispatch_outcome(tx: &mpsc::UnboundedSender<HostEvent>, o: ParseOutcome) {
