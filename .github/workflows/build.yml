@@ -71,6 +71,24 @@ jobs:
             librsvg2-dev \
             patchelf
 
+      # `tauri::generate_context!()` opens every icon in `tauri.conf.json`
+      # at compile time. The repo gitignores `src-tauri/icons/`, so we
+      # materialize a tiny 1x1 placeholder PNG for each referenced file
+      # before building. These are only used for the window icon in dev;
+      # real assets ship with tagged releases.
+      - name: Materialize placeholder icons
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src-tauri/icons
+          png_b64='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
+          for f in 32x32.png 128x128.png 128x128@2x.png icon.png; do
+            if [ ! -f "src-tauri/icons/$f" ]; then
+              printf '%s' "$png_b64" | base64 -d > "src-tauri/icons/$f"
+            fi
+          done
+          ls -la src-tauri/icons
+
       - name: Build Tauri binary
         run: npm run tauri build -- --target ${{ matrix.target }}
 
