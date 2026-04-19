@@ -92,28 +92,31 @@ jobs:
       - name: Build Tauri binary
         run: npm run tauri build -- --target ${{ matrix.target }}
 
-      - name: Stage bundle (Unix)
-        if: runner.os != 'Windows'
+      - name: Stage bundle
         shell: bash
         run: |
           set -euo pipefail
           stage="stage/aperture-${{ matrix.slug }}"
-          mkdir -p "$stage"
-          cp "src-tauri/target/${{ matrix.target }}/release/${{ matrix.exe }}" "$stage/aperture"
-          chmod +x "$stage/aperture"
-          cp -R runtime-shim "$stage/runtime-shim"
-          tar -czf "aperture-${{ matrix.slug }}.tar.gz" -C stage "aperture-${{ matrix.slug }}"
+          mkdir -p "$stage/runtime-shim" "$stage/node_modules"
 
-      - name: Stage bundle (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          stage="stage/aperture-${{ matrix.slug }}"
-          mkdir -p "$stage"
-          cp "src-tauri/target/${{ matrix.target }}/release/${{ matrix.exe }}" "$stage/aperture.exe"
-          cp -R runtime-shim "$stage/runtime-shim"
+          # Binary
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "src-tauri/target/${{ matrix.target }}/release/aperture.exe" "$stage/aperture.exe"
+          else
+            cp "src-tauri/target/${{ matrix.target }}/release/aperture" "$stage/aperture"
+            chmod +x "$stage/aperture"
+          fi
+
+          # Runtime shim (ship only the .mjs sources — tests and fixtures stay out)
+          for f in runtime-shim/*.mjs; do cp "$f" "$stage/runtime-shim/"; done
+
+          # Runtime node_modules. The binary adds `<stage>/node_modules` to
+          # NODE_PATH when it finds it next to runtime-shim. Ship every npm
+          # package the shim imports at runtime here.
+          cp -R node_modules/zod "$stage/node_modules/zod"
+
           tar -czf "aperture-${{ matrix.slug }}.tar.gz" -C stage "aperture-${{ matrix.slug }}"
+          ls -la "$stage"
 
       - name: Smoke test (Unix)
         if: runner.os != 'Windows'
