@@ -15,6 +15,7 @@ pub struct Layout {
     pub windows: PathBuf,
     pub logs: PathBuf,
     pub locks: PathBuf,
+    pub activity: PathBuf,
 }
 
 impl Layout {
@@ -34,6 +35,7 @@ impl Layout {
             windows: root.join("windows"),
             logs: root.join("logs"),
             locks: root.join("locks"),
+            activity: root.join("activity"),
             root,
         }
     }
@@ -47,6 +49,7 @@ impl Layout {
             &self.windows,
             &self.logs,
             &self.locks,
+            &self.activity,
         ] {
             ensure_dir(dir)?;
         }

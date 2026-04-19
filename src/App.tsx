@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { listen } from '@tauri-apps/api/event'
 import { invoke as tauriInvoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import type { BackendMessage, InvokeRequest, ProgressState, ScriptEvent, WindowConfig, WindowGeometry } from './types'
@@ -224,6 +223,7 @@ export default function App() {
           return
         case 'manifest':
           setUiTree(event.ui as UiNode)
+          setView((prev) => prev.kind === 'installing' || prev.kind === 'running' ? { kind: 'running' } : prev)
           void applyWindowConfig(event.window, scriptSourceRef.current, persistedGeometryRef.current)
           customFormattersRef.current = event.formatters ?? []
           registerCustomFormatters(event.formatters ?? [])
@@ -260,8 +260,22 @@ export default function App() {
   )
 
   useEffect(() => {
-    const unlistenPromise = listen<BackendMessage>('aperture://message', (evt) => {
-      const msg = evt.payload
+    let active = true
+
+    const poll = async () => {
+      while (active) {
+        try {
+          const msg = await tauriInvoke<BackendMessage>('poll_events')
+          if (!active) break
+          handleMsg(msg)
+        } catch {
+          // channel closed or error — stop polling
+          break
+        }
+      }
+    }
+
+    const handleMsg = (msg: BackendMessage) => {
       switch (msg.kind) {
         case 'launch':
           setCwd(msg.cwd)
@@ -322,17 +336,21 @@ export default function App() {
           }
           return
       }
-    })
+    }
 
     installDevHandle()
-    tauriInvoke('frontend_ready').catch((err) => {
+    void poll()
+
+    tauriInvoke<{ phase: string }>('frontend_ready').then(({ phase }) => {
+      if (phase === 'running') {
+        setView({ kind: 'running' })
+      }
+    }).catch((err) => {
       // eslint-disable-next-line no-console
       console.error('frontend_ready failed', err)
     })
 
-    return () => {
-      unlistenPromise.then((off) => off()).catch(() => {})
-    }
+    return () => { active = false }
   }, [handleScriptEvent, pushLog, devMode, addProtocolEntry])
 
   const reload = useCallback(async () => {

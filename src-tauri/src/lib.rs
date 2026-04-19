@@ -13,12 +13,14 @@
 //!   - Multi-instance polish (focus existing window, exit 0)
 //!   - Dev-mode protocol inspector
 
+pub mod activity;
 pub mod cache_key;
 pub mod child;
 pub mod chunks;
 pub mod cli;
 pub mod config;
 pub mod deps;
+pub mod diag;
 pub mod events;
 pub mod fs_layout;
 pub mod invoke_cmds;
@@ -57,6 +59,13 @@ pub struct AppState {
     pub cache_key: Mutex<String>,
     /// One-shot channel for the env-approval frontend response.
     pub env_approval_tx: Mutex<Option<tokio::sync::oneshot::Sender<bool>>>,
+    /// One-shot channel fired when the frontend signals it is ready to receive events.
+    pub frontend_ready_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Watch channel: lifecycle_entry sets true once the child process is spawned.
+    pub child_running: tokio::sync::watch::Sender<bool>,
+    /// Event queue: all backend→frontend messages go here; frontend polls via poll_events.
+    pub event_tx: mpsc::UnboundedSender<Value>,
+    pub event_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Value>>,
 }
 
 #[derive(Clone)]
@@ -148,6 +157,7 @@ pub fn run() -> anyhow::Result<()> {
 
     let layout = Layout::resolve()?;
     layout.ensure()?;
+    diag::init(&layout.logs);
 
     let canonical = parsed.source.canonical_identity();
     match lock::try_acquire(&layout.locks, &canonical)? {
@@ -172,6 +182,9 @@ pub fn run() -> anyhow::Result<()> {
         anyhow::anyhow!("runtime shim not found: {} (expected runtime-shim/ next to the binary)", e)
     })?;
 
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let (child_running_tx, _child_running_rx) = tokio::sync::watch::channel(false);
+    let (event_tx, event_rx) = mpsc::unbounded_channel::<Value>();
     let state = Arc::new(AppState {
         args: parsed,
         layout,
@@ -181,6 +194,10 @@ pub fn run() -> anyhow::Result<()> {
         dev_mode,
         cache_key: Mutex::new(String::new()),
         env_approval_tx: Mutex::new(None),
+        frontend_ready_tx: Mutex::new(Some(ready_tx)),
+        child_running: child_running_tx,
+        event_tx,
+        event_rx: tokio::sync::Mutex::new(event_rx),
     });
 
     tauri::Builder::default()
@@ -198,6 +215,7 @@ pub fn run() -> anyhow::Result<()> {
             env_approve,
             save_window_geometry,
             open_log_file,
+            poll_events,
             invoke_cmds::aperture_file_picker,
             invoke_cmds::aperture_notification,
             invoke_cmds::aperture_open_external,
@@ -208,7 +226,7 @@ pub fn run() -> anyhow::Result<()> {
             let handle = app.handle().clone();
             let state = state.clone();
             tauri::async_runtime::spawn(async move {
-                lifecycle_entry(handle, state).await;
+                lifecycle_entry(handle, state, ready_rx).await;
             });
             Ok(())
         })
@@ -235,7 +253,7 @@ pub fn run() -> anyhow::Result<()> {
 // ─────────────────────────────── Tauri commands ───────────────────────────────
 
 #[tauri::command]
-async fn frontend_ready(app: AppHandle, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+async fn frontend_ready(app: AppHandle, state: tauri::State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
     let cache_key = state.cache_key.lock().clone();
     let geometry = if !cache_key.is_empty() {
         config::WindowGeometry::load(&state.layout.windows, &cache_key)
@@ -254,7 +272,22 @@ async fn frontend_ready(app: AppHandle, state: tauri::State<'_, Arc<AppState>>) 
         })),
     };
     emit(&app, &msg);
-    Ok(())
+
+    // Unblock lifecycle_entry.
+    if let Some(tx) = state.frontend_ready_tx.lock().take() {
+        let _ = tx.send(());
+    }
+
+    // Wait for the child to be spawned (or timeout after 30 s).
+    let mut rx = state.child_running.subscribe();
+    diag::diag!("frontend_ready: waiting for child_running signal");
+    let running = tokio::time::timeout(
+        tokio::time::Duration::from_secs(30),
+        rx.wait_for(|v| *v),
+    ).await.is_ok();
+    diag::diag!("frontend_ready: child_running={running} — returning to frontend");
+
+    Ok(serde_json::json!({ "phase": if running { "running" } else { "timeout" } }))
 }
 
 #[tauri::command]
@@ -268,7 +301,10 @@ async fn reload_script(app: AppHandle, state: tauri::State<'_, Arc<AppState>>) -
     }
     let state_clone: Arc<AppState> = (*state).clone();
     tauri::async_runtime::spawn(async move {
-        lifecycle_entry(app, state_clone).await;
+        // On reload the frontend is already listening; use a pre-fired channel.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let _ = tx.send(());
+        lifecycle_entry(app, state_clone, rx).await;
     });
     Ok(())
 }
@@ -286,6 +322,7 @@ async fn send_to_child(
         return Err("no running child".into());
     };
     let line = serde_json::to_string(&event).map_err(|e| e.to_string())?;
+    activity::record_host_event(&event);
     handle.send_line(&line).await.map_err(|e| e.to_string())
 }
 
@@ -344,19 +381,34 @@ async fn open_log_file(state: tauri::State<'_, Arc<AppState>>) -> Result<(), Str
 
 // ─────────────────────────────── lifecycle ────────────────────────────────────
 
-async fn lifecycle_entry(app: AppHandle, state: Arc<AppState>) {
+async fn lifecycle_entry(
+    app: AppHandle,
+    state: Arc<AppState>,
+    frontend_ready: tokio::sync::oneshot::Receiver<()>,
+) {
     let session = state.session.fetch_add(1, Ordering::SeqCst) + 1;
+    diag::diag!("lifecycle_entry: session={session} — waiting for frontend_ready");
+
+    // Wait for the frontend to register its event listener before emitting anything.
+    let _ = frontend_ready.await;
+    diag::diag!("lifecycle_entry: frontend_ready received — emitting Phase::Installing");
     emit(&app, &BackendMessage::Phase { phase: Phase::Installing });
 
     // ── Resolve the script path (download if remote) ───────────────────────────
+    diag::diag!("lifecycle_entry: resolving script path");
     let script_path = match resolve_script(&app, &state, session).await {
         Some(p) => p,
-        None => return, // error already emitted
+        None => {
+            diag::diag!("lifecycle_entry: resolve_script returned None — aborting");
+            return;
+        }
     };
+    diag::diag!("lifecycle_entry: script_path={}", script_path.display());
 
     // ── Parse deps + env from script header ────────────────────────────────────
     let script_deps = deps::parse_deps_from_script(&script_path);
     let script_env = config::parse_env_from_script(&script_path);
+    diag::diag!("lifecycle_entry: deps={:?}  env_vars={:?}", script_deps, script_env);
 
     // ── Compute / store cache key ──────────────────────────────────────────────
     let cache_key = cache_key::derive(&script_path)
@@ -364,6 +416,13 @@ async fn lifecycle_entry(app: AppHandle, state: Arc<AppState>) {
         .flatten()
         .unwrap_or_default();
     *state.cache_key.lock() = cache_key.clone();
+    diag::diag!("lifecycle_entry: cache_key={:?}", cache_key);
+
+    activity::init(
+        &state.layout.activity,
+        &script_path.display().to_string(),
+        &cache_key,
+    );
 
     // ── Env-var approval ───────────────────────────────────────────────────────
     if !script_env.is_empty() {
@@ -430,9 +489,14 @@ async fn lifecycle_entry(app: AppHandle, state: Arc<AppState>) {
     let approved_env = config::build_approved_env(&script_env);
 
     // ── Node binary ───────────────────────────────────────────────────────────
+    diag::diag!("lifecycle_entry: resolving node binary");
     let node_bin = match resolve_node() {
-        Ok(p) => p,
+        Ok(p) => {
+            diag::diag!("lifecycle_entry: node found at {}", p.display());
+            p
+        }
         Err(err) => {
+            diag::diag!("lifecycle_entry: node NOT found — {err}");
             emit_if_current(
                 &app,
                 &state,
@@ -454,6 +518,7 @@ async fn lifecycle_entry(app: AppHandle, state: Arc<AppState>) {
     if shared_nm.is_dir() {
         node_paths.push(shared_nm);
     }
+    diag::diag!("lifecycle_entry: node_paths={:?}", node_paths);
 
     let cli_flags_json =
         serde_json::to_string(&state.args.raw_flags).unwrap_or_else(|_| "{}".to_string());
@@ -481,9 +546,15 @@ async fn lifecycle_entry(app: AppHandle, state: Arc<AppState>) {
         log_path,
     };
 
+    diag::diag!("lifecycle_entry: loader={} bootstrap={} script={}",
+        state.bundled.loader_module.display(),
+        state.bundled.bootstrap_module.display(),
+        cfg.script_path.display());
+    diag::diag!("lifecycle_entry: spawning child process");
     let Spawned { handle, events } = match child::spawn(cfg) {
         Ok(s) => s,
         Err(err) => {
+            diag::diag!("lifecycle_entry: spawn FAILED — {err}");
             emit_if_current(
                 &app,
                 &state,
@@ -496,6 +567,8 @@ async fn lifecycle_entry(app: AppHandle, state: Arc<AppState>) {
             return;
         }
     };
+    diag::diag!("lifecycle_entry: child spawned OK — emitting Phase::Running");
+    let _ = state.child_running.send(true);
 
     {
         let mut slot = state.child.lock();
@@ -503,7 +576,9 @@ async fn lifecycle_entry(app: AppHandle, state: Arc<AppState>) {
     }
 
     emit_if_current(&app, &state, session, &BackendMessage::Phase { phase: Phase::Running });
+    diag::diag!("lifecycle_entry: entering drive loop");
     drive(app, state, session, events).await;
+    diag::diag!("lifecycle_entry: drive loop exited (session={session})");
 }
 
 /// Resolve the local path for the script — downloading from remote URL if needed.
@@ -566,33 +641,51 @@ async fn drive(
     mut events: mpsc::UnboundedReceiver<HostEvent>,
 ) {
     let mut chunks = ChunkBuffers::new();
+    let mut event_count = 0u64;
+    diag::diag!("drive: waiting for first child event");
     while let Some(ev) = events.recv().await {
+        event_count += 1;
         if state.session.load(Ordering::SeqCst) != session {
             continue;
         }
         match ev {
-            HostEvent::Stdout(value) => {
+            HostEvent::Stdout(ref value) => {
+                let ty = value.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+                diag::diag!("drive: stdout event #{event_count} type={ty}");
+                activity::record_script_event(value);
                 if state.dev_mode {
                     emit(&app, &BackendMessage::ProtocolEvent {
                         direction: "inbound".to_string(),
                         event: value.clone(),
                     });
                 }
-                route_script_event(&app, &mut chunks, value);
+                route_script_event(&app, &mut chunks, value.clone());
             }
-            HostEvent::ParseError { line, error } => {
-                emit(&app, &BackendMessage::ParseError { line, error });
+            HostEvent::ParseError { ref line, ref error } => {
+                diag::diag!("drive: parse-error #{event_count} err={error} line={line}");
+                emit(&app, &BackendMessage::ParseError { line: line.clone(), error: error.clone() });
             }
-            HostEvent::Stderr(line) => {
-                emit(&app, &BackendMessage::Stderr { line });
+            HostEvent::Stderr(ref line) => {
+                diag::diag!("drive: stderr #{event_count} {line}");
+                emit(&app, &BackendMessage::Stderr { line: line.clone() });
             }
-            HostEvent::Exit { code, signal, stderr_tail } => {
+            HostEvent::Exit { code, ref signal, ref stderr_tail } => {
+                diag::diag!("drive: child EXIT code={code:?} signal={signal:?} stderr_tail={stderr_tail:?}");
+                activity::log(serde_json::json!({
+                    "ts": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis()).unwrap_or(0),
+                    "type": "exit",
+                    "code": code,
+                    "signal": signal,
+                    "stderrTail": stderr_tail,
+                }));
                 emit(
                     &app,
                     &BackendMessage::ChildExit {
                         code,
-                        signal,
-                        stderr_tail,
+                        signal: signal.clone(),
+                        stderr_tail: stderr_tail.clone(),
                         log_available: has_log(&state),
                     },
                 );
@@ -600,6 +693,7 @@ async fn drive(
             }
         }
     }
+    diag::diag!("drive: loop ended after {event_count} events");
 }
 
 fn has_log(state: &AppState) -> bool {
@@ -642,14 +736,41 @@ fn route_script_event(app: &AppHandle, chunks: &mut ChunkBuffers, value: Value) 
 }
 
 fn emit_if_current(app: &AppHandle, state: &AppState, session: u64, msg: &BackendMessage) {
-    if state.session.load(Ordering::SeqCst) == session {
+    let current = state.session.load(Ordering::SeqCst);
+    if current == session {
         emit(app, msg);
+    } else {
+        diag::diag!("emit_if_current: SKIPPED session mismatch current={current} expected={session}");
     }
 }
 
 fn emit(app: &AppHandle, msg: &BackendMessage) {
-    if let Err(err) = app.emit(EVENT_CHANNEL, msg) {
-        tracing::warn!(?err, "failed to emit backend message");
+    let kind = match msg {
+        BackendMessage::Phase { phase } => format!("phase::{phase:?}"),
+        BackendMessage::Launch { .. } => "launch".to_string(),
+        BackendMessage::Fatal { .. } => "fatal".to_string(),
+        BackendMessage::ChildExit { code, .. } => format!("child-exit({code:?})"),
+        _ => "other".to_string(),
+    };
+    diag::diag!("emit: {kind}");
+    if let Some(state) = app.try_state::<Arc<AppState>>() {
+        if let Ok(value) = serde_json::to_value(msg) {
+            let _ = state.event_tx.send(value);
+            return;
+        }
+    }
+    // Fallback: direct window emit (keeps things working outside normal lifecycle).
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.emit(EVENT_CHANNEL, msg);
+    }
+}
+
+#[tauri::command]
+async fn poll_events(state: tauri::State<'_, Arc<AppState>>) -> Result<Value, String> {
+    let mut rx = state.event_rx.lock().await;
+    match rx.recv().await {
+        Some(event) => Ok(event),
+        None => Err("event channel closed".into()),
     }
 }
 

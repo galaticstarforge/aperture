@@ -395,8 +395,9 @@ if (manifest.onLoad) {
   emit({ type: 'result', data: null })
 }
 
-// Mirror initial state to the GUI once.
-for (const [k, v] of Object.entries(initialState)) {
+// Mirror current state to the GUI once (use store.values, not initialState,
+// so values written by onLoad are not overwritten by stale defaults).
+for (const [k, v] of store.values) {
   if (store.streamKeys.has(k)) {
     store.set(k, v, 'script')
   } else {

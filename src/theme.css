@@ -329,6 +329,17 @@ button.secondary {
   transition: width 200ms ease;
 }
 
+.ap-table__th,
+.ap-table__td {
+  text-align: center;
+  vertical-align: middle;
+  padding: 6px 10px;
+}
+
+.ap-table__th-inner {
+  justify-content: center;
+}
+
 .ap-code {
   background: var(--ap-bg-elev);
   border: 1px solid var(--ap-border);

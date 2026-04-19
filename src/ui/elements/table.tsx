@@ -1,17 +1,36 @@
 import { useState, useMemo, useRef, useCallback } from 'react'
-import { useVirtualizer } from '@tanstack/react-virtual'
 import { ChevronUp, ChevronDown } from 'lucide-react'
 import type { TableNode, TableColumn, UiNode } from '../types'
 import { useStateValue, useFormattedValue } from '../hooks'
-import { useDispatch } from '../dispatch'
+import { useDispatch, DispatchContext, type DispatchFn } from '../dispatch'
 import { Element } from '../Element'
 
 type SortDir = 'asc' | 'desc'
 
-function CellValue({ col, value }: { col: TableColumn; value: unknown; row?: unknown }) {
+function CellValue({
+  col,
+  value,
+  row,
+  rowDataAs,
+}: {
+  col: TableColumn
+  value: unknown
+  row?: unknown
+  rowDataAs?: string
+}) {
+  const parentDispatch = useDispatch()
+  const wrappedDispatch = useMemo<DispatchFn>(() => {
+    if (!rowDataAs || row == null) return parentDispatch
+    return (fn, args = {}) =>
+      parentDispatch(fn, { ...(args as object), [rowDataAs]: row })
+  }, [parentDispatch, rowDataAs, row])
   const formatted = useFormattedValue(col.format, value)
   if (col.cell) {
-    return <Element node={col.cell as UiNode} />
+    return (
+      <DispatchContext.Provider value={wrappedDispatch}>
+        <Element node={col.cell as UiNode} />
+      </DispatchContext.Provider>
+    )
   }
   return (
     <span style={formatted.color ? { color: formatted.color } : undefined}>
@@ -111,12 +130,6 @@ export function TableElement({ node }: { node: TableNode }) {
   }, [filtered, sortKey, sortDir])
 
   const parentRef = useRef<HTMLDivElement>(null)
-  const virtualizer = useVirtualizer({
-    count: sorted.length,
-    getScrollElement: () => parentRef.current,
-    estimateSize: () => 36,
-    overscan: 10,
-  })
 
   const toggleSelect = useCallback(
     (id: string | number) => {
@@ -138,7 +151,11 @@ export function TableElement({ node }: { node: TableNode }) {
 
   return (
     <div className="ap-table-wrap">
-      <div className="ap-table-scroll" ref={parentRef} style={{ overflowY: 'auto', maxHeight: '60vh' }}>
+      <div
+        className="ap-table-scroll"
+        ref={parentRef}
+        style={{ overflowY: 'auto', maxHeight: '60vh', position: 'relative' }}
+      >
         <table className="ap-table" style={{ tableLayout: 'fixed', width: '100%' }}>
           <thead className="ap-table__head">
             <tr>
@@ -156,25 +173,15 @@ export function TableElement({ node }: { node: TableNode }) {
               ))}
             </tr>
           </thead>
-          <tbody style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
-            {virtualizer.getVirtualItems().map((vRow) => {
-              const row = sorted[vRow.index] as Record<string, unknown>
+          <tbody>
+            {sorted.map((r, idx) => {
+              const row = r as Record<string, unknown>
               const id = row[rowKey] as string | number
               const selected = selectedIds.includes(id)
               return (
                 <tr
-                  key={vRow.key}
+                  key={id ?? idx}
                   className={`ap-table__row${selected ? ' ap-table__row--selected' : ''}`}
-                  style={{
-                    position: 'absolute',
-                    top: 0,
-                    transform: `translateY(${vRow.start}px)`,
-                    width: '100%',
-                    display: 'table',
-                    tableLayout: 'fixed',
-                  }}
-                  data-index={vRow.index}
-                  ref={virtualizer.measureElement}
                 >
                   {node.selectable && (
                     <td className="ap-table__td ap-table__td--check">
@@ -187,7 +194,12 @@ export function TableElement({ node }: { node: TableNode }) {
                   )}
                   {columns.map((col) => (
                     <td key={col.key} className="ap-table__td">
-                      <CellValue col={col} value={row[col.key]} row={row} />
+                      <CellValue
+                        col={col}
+                        value={row[col.key]}
+                        row={row}
+                        rowDataAs={node.rowDataAs}
+                      />
                     </td>
                   ))}
                 </tr>
