@@ -72,21 +72,28 @@ jobs:
             patchelf
 
       # `tauri::generate_context!()` opens every icon in `tauri.conf.json`
-      # at compile time. The repo gitignores `src-tauri/icons/`, so we
-      # materialize a tiny 1x1 placeholder PNG for each referenced file
-      # before building. These are only used for the window icon in dev;
-      # real assets ship with tagged releases.
+      # at compile time, and `tauri-build` on Windows additionally requires an
+      # `icon.ico` for the .exe Windows Resource. The repo gitignores
+      # `src-tauri/icons/`, so we materialize tiny 1x1 placeholders for each
+      # referenced asset before building. Real assets ship with tagged releases.
       - name: Materialize placeholder icons
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p src-tauri/icons
+          # 1x1 transparent PNG (70 bytes)
           png_b64='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
           for f in 32x32.png 128x128.png 128x128@2x.png icon.png; do
             if [ ! -f "src-tauri/icons/$f" ]; then
               printf '%s' "$png_b64" | base64 -d > "src-tauri/icons/$f"
             fi
           done
+          # 1x1 ICO wrapping the same PNG payload (92 bytes) — needed by
+          # tauri-winres on Windows builds.
+          ico_b64='AAABAAEAAQEAAAEAIABGAAAAFgAAAIlQTkcNChoKAAAADUlIRFIAAAABAAAAAQgGAAAAHxXEiQAAAA1JREFUeNpjZPjPUA8AA4YBgFo0fWsAAAAASUVORK5CYII='
+          if [ ! -f "src-tauri/icons/icon.ico" ]; then
+            printf '%s' "$ico_b64" | base64 -d > "src-tauri/icons/icon.ico"
+          fi
           ls -la src-tauri/icons
 
       - name: Build Tauri binary
