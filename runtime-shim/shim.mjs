@@ -132,6 +132,14 @@ function nextCallId() {
 const _pendingInvokes = new Map()
 const _pendingStreams = new Map()
 
+// Headless-mode guard. `aperture run` sets APERTURE_HEADLESS=1; in that mode
+// we reject the GUI-only invoke targets with 'not-available-headless' so
+// scripts fail fast instead of dead-locking waiting for a response. Previously
+// bootstrap tried to rewrite `runtime.invoke` via Object.defineProperty on the
+// ESM namespace, which is non-configurable under Node 22 and broke at startup.
+const _IS_HEADLESS = process.env.APERTURE_HEADLESS === '1'
+const _HEADLESS_GUI_ONLY = new Set(['filePicker', 'confirm', 'prompt', 'notification'])
+
 export function __resolveInvoke(callId, result) {
   const pending = _pendingInvokes.get(callId)
   if (pending) {
@@ -165,6 +173,9 @@ export function __abortStream(callId, errorMsg) {
 }
 
 export function invoke(fn, args = {}) {
+  if (_IS_HEADLESS && _HEADLESS_GUI_ONLY.has(fn)) {
+    return Promise.reject(new Error('not-available-headless'))
+  }
   return new Promise((resolve, reject) => {
     if (signal.aborted) {
       reject(new DOMException(String(signal.reason ?? 'Aborted'), 'AbortError'))

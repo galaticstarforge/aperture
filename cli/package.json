@@ -1,0 +1,30 @@
+{
+  "name": "@aperture/cli",
+  "version": "0.1.0",
+  "description": "CLI launcher for Aperture — downloads and runs the platform-specific binary",
+  "type": "module",
+  "bin": {
+    "aperture": "./bin/aperture.mjs"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/galaticstarforge/aperture.git",
+    "directory": "cli"
+  },
+  "keywords": [
+    "aperture",
+    "cli",
+    "gui",
+    "mjs",
+    "runner"
+  ],
+  "license": "MIT"
+}

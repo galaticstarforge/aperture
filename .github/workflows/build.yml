@@ -1,0 +1,193 @@
+name: Build Binaries
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.slug }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            slug: linux-x64
+            exe: aperture
+          - os: macos-13
+            target: x86_64-apple-darwin
+            slug: darwin-x64
+            exe: aperture
+          - os: macos-14
+            target: aarch64-apple-darwin
+            slug: darwin-arm64
+            exe: aperture
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            slug: win32-x64
+            exe: aperture.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install npm deps
+        run: npm ci
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.target }}
+
+      - name: Install Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      # `tauri::generate_context!()` opens every icon in `tauri.conf.json`
+      # at compile time, and `tauri-build` on Windows additionally requires an
+      # `icon.ico` for the .exe Windows Resource. The repo gitignores
+      # `src-tauri/icons/`, so we materialize tiny 1x1 placeholders for each
+      # referenced asset before building. Real assets ship with tagged releases.
+      - name: Materialize placeholder icons
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src-tauri/icons
+          # 1x1 transparent PNG (70 bytes)
+          png_b64='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
+          for f in 32x32.png 128x128.png 128x128@2x.png icon.png; do
+            if [ ! -f "src-tauri/icons/$f" ]; then
+              printf '%s' "$png_b64" | base64 -d > "src-tauri/icons/$f"
+            fi
+          done
+          # 1x1 ICO wrapping the same PNG payload (92 bytes) — needed by
+          # tauri-winres on Windows builds.
+          ico_b64='AAABAAEAAQEAAAEAIABGAAAAFgAAAIlQTkcNChoKAAAADUlIRFIAAAABAAAAAQgGAAAAHxXEiQAAAA1JREFUeNpjZPjPUA8AA4YBgFo0fWsAAAAASUVORK5CYII='
+          if [ ! -f "src-tauri/icons/icon.ico" ]; then
+            printf '%s' "$ico_b64" | base64 -d > "src-tauri/icons/icon.ico"
+          fi
+          ls -la src-tauri/icons
+
+      - name: Build Tauri binary
+        run: npm run tauri build -- --target ${{ matrix.target }}
+
+      - name: Stage bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="stage/aperture-${{ matrix.slug }}"
+          mkdir -p "$stage/runtime-shim" "$stage/node_modules"
+
+          # Binary
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "src-tauri/target/${{ matrix.target }}/release/aperture.exe" "$stage/aperture.exe"
+          else
+            cp "src-tauri/target/${{ matrix.target }}/release/aperture" "$stage/aperture"
+            chmod +x "$stage/aperture"
+          fi
+
+          # Runtime shim (ship only the .mjs sources — tests and fixtures stay out)
+          for f in runtime-shim/*.mjs; do cp "$f" "$stage/runtime-shim/"; done
+
+          # Runtime node_modules. The binary adds `<stage>/node_modules` to
+          # NODE_PATH when it finds it next to runtime-shim. Ship every npm
+          # package the shim imports at runtime here.
+          cp -R node_modules/zod "$stage/node_modules/zod"
+
+          tar -czf "aperture-${{ matrix.slug }}.tar.gz" -C stage "aperture-${{ matrix.slug }}"
+          ls -la "$stage"
+
+      - name: Smoke test (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          tar -xzf "aperture-${{ matrix.slug }}.tar.gz" -C "$tmp"
+          "$tmp/aperture-${{ matrix.slug }}/aperture" run ./examples/ci-smoke.mjs .
+
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          tar -xzf "aperture-${{ matrix.slug }}.tar.gz" -C "$tmp"
+          "$tmp/aperture-${{ matrix.slug }}/aperture.exe" run ./examples/ci-smoke.mjs .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aperture-${{ matrix.slug }}
+          path: aperture-${{ matrix.slug }}.tar.gz
+          if-no-files-found: error
+
+  publish-nightly:
+    name: Publish nightly release
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Delete previous nightly release + tag
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete nightly --yes --cleanup-tag || true
+
+      - name: Publish nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: "Nightly (${{ github.sha }})"
+          prerelease: true
+          body: |
+            Rolling nightly build from `${{ github.ref_name }}` @ `${{ github.sha }}`.
+
+            Artifacts contain the `aperture` binary alongside the `runtime-shim/`
+            directory. Used by `@aperture/cli` to run scripts on any machine with
+            Node.js installed.
+          files: |
+            dist/aperture-linux-x64.tar.gz
+            dist/aperture-darwin-x64.tar.gz
+            dist/aperture-darwin-arm64.tar.gz
+            dist/aperture-win32-x64.tar.gz

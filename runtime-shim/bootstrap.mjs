@@ -144,27 +144,8 @@ const store = new StateStore({
 runtime.__installStore(store)
 
 // --- headless invoke guard ---------------------------------------------------
-// In headless mode, GUI-dependent invoke targets throw 'not-available-headless'.
-if (IS_HEADLESS) {
-  const GUI_ONLY = new Set(['filePicker', 'confirm', 'prompt', 'notification'])
-  const origInvoke = runtime.invoke
-  // Replace the invoke export with a guarded version. Because shim exports are
-  // live bindings we use the internal __installHeadlessGuard hook if available,
-  // otherwise we patch via Object.defineProperty on the module namespace.
-  // Since we can't reassign named exports from outside, we wrap at call sites
-  // by patching the runtime object's prototype chain. The simplest approach:
-  // override runtime.invoke by shadowing it on the runtime namespace object.
-  Object.defineProperty(runtime, 'invoke', {
-    configurable: true,
-    writable: true,
-    value: function headlessInvoke(fn, args) {
-      if (GUI_ONLY.has(fn)) {
-        return Promise.reject(new Error('not-available-headless'))
-      }
-      return origInvoke(fn, args)
-    },
-  })
-}
+// Implemented inside shim.mjs at `invoke` itself — ESM namespaces are
+// non-configurable, so we can't swap the export from here.
 
 // --- emit manifest event (GUI only) ------------------------------------------
 
